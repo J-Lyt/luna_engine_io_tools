@@ -13,6 +13,12 @@ import uuid
 from types import SimpleNamespace
 
 
+try:
+    import numpy as np
+except Exception:  
+    np = SimpleNamespace()
+
+
 def _numpy_available():
     return getattr(np, "ndarray", None) is not None
 
@@ -74,12 +80,6 @@ def _corner_normal_signature_fast(normals):
         return hashlib.sha1(scaled.astype("<i2").tobytes()).hexdigest()
     except Exception:
         return None
-
-
-try:
-    import numpy as np
-except Exception:  
-    np = SimpleNamespace()
 
 
 def model_shape_key_delta_signature(basis_key, target_key):

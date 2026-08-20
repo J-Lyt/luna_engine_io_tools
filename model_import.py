@@ -127,8 +127,6 @@ def _decode_packed_tangent_array(words, position_w):
     normal_z = np.clip(nt_zs - 1.0, 0.0, 1.0)
     tangent_z = nt_zs - normal_z * 2.0
     return _decode_azimuthal_array(tangent_x, tangent_y, tangent_z)
-
-
 def _engine_delta_to_blender(delta):
     return (float(delta[0]), -float(delta[2]), float(delta[1]))
 
