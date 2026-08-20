@@ -12,6 +12,7 @@ from . import (
     flags,
     hashes,
     model_export,
+    model_hair,
     model_import,
     model_morph,
     model_ziva,
@@ -38,6 +39,7 @@ _LOGIC_MODULES = (
     model_import,
     model_morph,
     model_ziva,
+    model_hair,
     model_export,
     anim_import,
     anim_export,
@@ -82,7 +84,13 @@ def menu_func_export_model(self, context):
 CLASSES = (
     properties.MODEL_PG_morph_preview,
     model_import.ImportEngineModel,
+    model_export.MODEL_OT_select_original_model_for_export,
     model_export.ExportEngineModel,
+    model_hair.MODEL_PG_hair_description,
+    model_hair.MODEL_OT_import_strand_hair,
+    model_hair.MODEL_OT_create_hair_guide_mesh,
+    model_hair.MODEL_OT_select_hair_guide_mesh,
+    model_hair.MODEL_OT_apply_hair_simple_color,
     anim_import.ImportEngineAnim,
     anim_export.ExportEngineAnim,
     operators.MODEL_OT_export_with_model_settings,
@@ -104,6 +112,7 @@ CLASSES = (
     operators.MODEL_OT_remove_selected_from_look_group,
     panels.MaterialPanel,
     panels.ModelPanel,
+    model_hair.ModelHairPanel,
     panels.CameraAnimPanel,
     panels.AnimPlaybackPanel,
     operators.ANIM_OT_jump_to_frame,
@@ -127,6 +136,7 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     properties.register_properties()
+    model_hair.register_hair_properties()
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import_model)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import_anim)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export_model)
@@ -138,6 +148,7 @@ def unregister():
     _safe_menu_remove(bpy.types.TOPBAR_MT_file_export, menu_func_export_model)
     _safe_menu_remove(bpy.types.TOPBAR_MT_file_import, menu_func_import_anim)
     _safe_menu_remove(bpy.types.TOPBAR_MT_file_import, menu_func_import_model)
+    model_hair.unregister_hair_properties()
     properties.unregister_properties()
     for cls in reversed(CLASSES):
         try:

@@ -9,6 +9,7 @@ import struct
 import numpy as np
 
 from .hashes import BLOCK_HASHES, string_crc32
+from .utils import model_shape_key_delta_signature
 
 
 ZIVA_INFO_SIZE = 144
@@ -25,6 +26,7 @@ ZIVA_STAGE_RBF = 2
 ZIVA_STAGE_EIGEN = 3
 ZIVA_STAGE_TENSOR = 4
 ZIVA_STAGE_SCATTER = 5
+ZIVA_TRANSFER_DELTA_EPSILON = 0.00000001
 ZIVA_SUPPORTED_STAGES = {
     ZIVA_STAGE_KERNEL,
     ZIVA_STAGE_RBF,
@@ -495,24 +497,44 @@ class ZivaModel:
         scattered, scatter_indices, inverse, inverse_indices, rest, int_constants, float_constants = buffers
         vertex_count = int(int_constants[0])
         input_vertices = input_values.reshape(-1, 3)
+
+        scatter_offsets = np.asarray(scattered[:vertex_count * 2:2], dtype=np.int64)
+        scatter_counts = np.asarray(scattered[1:vertex_count * 2:2], dtype=np.int64)
         combined = np.zeros((vertex_count, 3), dtype=np.float32)
-        for vertex in range(vertex_count):
-            offset, count = (int(value) for value in scattered[vertex * 2:vertex * 2 + 2])
-            if count == 1:
-                combined[vertex] = input_vertices[offset]
-            elif count:
-                combined[vertex] = input_vertices[scatter_indices[offset:offset + count].astype(np.int64)].sum(axis=0)
+        single = scatter_counts == 1
+        if single.any():
+            combined[single] = input_vertices[scatter_offsets[single]]
+        for vertex in np.flatnonzero(scatter_counts > 1):
+            offset = int(scatter_offsets[vertex])
+            count = int(scatter_counts[vertex])
+            combined[vertex] = input_vertices[
+                scatter_indices[offset:offset + count].astype(np.int64)
+            ].sum(axis=0)
+
         final = (combined + rest[:vertex_count * 3].reshape(vertex_count, 3)) * float_constants[:3]
         output = np.zeros(self.max_vertex_count * 3, dtype=np.float32)
         component_offsets = [int(int_constants[index]) for index in (1, 2, 3)]
-        for vertex in range(vertex_count):
-            offset, count = (int(value) for value in inverse[vertex * 2:vertex * 2 + 2])
-            destinations = (offset,) if count == 1 else inverse_indices[offset:offset + count]
-            for destination in destinations:
-                destination = int(destination)
-                output[destination + component_offsets[0]] = final[vertex, 0]
-                output[destination + component_offsets[1]] = final[vertex, 1]
-                output[destination + component_offsets[2]] = final[vertex, 2]
+
+        inverse_offsets = np.asarray(inverse[:vertex_count * 2:2], dtype=np.int64)
+        inverse_counts = np.asarray(inverse[1:vertex_count * 2:2], dtype=np.int64)
+        active = np.flatnonzero(inverse_counts > 0)
+        if len(active):
+            counts = inverse_counts[active]
+            starts = inverse_offsets[active]
+            repeated_starts = np.repeat(starts, counts)
+            vertex_ids = np.repeat(active, counts)
+            total = int(counts.sum())
+            segment_starts = np.repeat(np.cumsum(counts) - counts, counts)
+            positions = np.arange(total, dtype=np.int64) - segment_starts + repeated_starts
+            indirect = np.asarray(inverse_indices, dtype=np.int64)
+            destinations = np.where(
+                np.repeat(counts == 1, counts),
+                repeated_starts,
+                indirect[np.clip(positions, 0, max(len(indirect) - 1, 0))],
+            )
+            values = final[vertex_ids]
+            for axis in range(3):
+                output[destinations + component_offsets[axis]] = values[:, axis]
         return output
 
     def evaluate_element(self, elem_index=0, slider_values=None, joint_local_matrices=None):
@@ -767,7 +789,8 @@ def _ziva_write_shape_key(obj, channel, local_delta, overwrite=False):
 
     if len(local_delta) != len(obj.data.vertices):
         raise ValueError(f"{obj.name}: transfer delta count does not match mesh vertices")
-    affected = np.linalg.norm(local_delta, axis=1) >= 0.0001
+# improves accuracy?
+    affected = np.linalg.norm(local_delta, axis=1) >= ZIVA_TRANSFER_DELTA_EPSILON
     if not np.any(affected):
         return "EMPTY"
     if obj.data.shape_keys is None or not obj.data.shape_keys.key_blocks:
@@ -797,6 +820,7 @@ def _ziva_write_shape_key(obj, channel, local_delta, overwrite=False):
         "index": int(channel["index"]),
         "ziva_kind": channel["kind"],
         "driver_status": channel["driver_status"],
+        "source_delta_signature": model_shape_key_delta_signature(basis, key),
     }
     obj["engine_morph_targets_json"] = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
     obj["engine_morph_shape_keys_imported"] = True

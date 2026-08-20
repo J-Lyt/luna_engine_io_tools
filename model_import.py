@@ -85,6 +85,50 @@ def _decode_packed_normal(word):
     return _decode_azimuthal(x, y, normal_z)
 
 
+def _decode_packed_tangent(word, position_w):
+    word = int(word) & U32_MASK
+    tangent_x = float((word >> 20) & 0x3FF) / 1023.0
+    tangent_y = float(abs(int(position_w)) & 0x3FF) / 1023.0
+    nt_zs = float((word >> 30) & 0x3)
+    normal_z = max(0.0, min(1.0, nt_zs - 1.0))
+    tangent_z = nt_zs - normal_z * 2.0
+    return _decode_azimuthal(tangent_x, tangent_y, tangent_z)
+
+
+def _decode_azimuthal_array(x, y, z_sign):
+    enc_x = x * (4.0 / 1.41421356) - (2.0 / 1.41421356)
+    enc_y = y * (4.0 / 1.41421356) - (2.0 / 1.41421356)
+    f = enc_x * enc_x + enc_y * enc_y
+    xy_scale = np.sqrt(np.maximum(0.0, 1.0 - f * 0.25))
+    z = np.abs(1.0 - f * 0.5)
+    z = np.where(z_sign < 0.5, -z, z)
+    out = np.empty((len(enc_x), 3), dtype=np.float64)
+    out[:, 0] = enc_x * xy_scale
+    out[:, 1] = enc_y * xy_scale
+    out[:, 2] = z
+    return out
+
+
+def _decode_packed_normal_array(words):
+    words = np.asarray(words, dtype=np.uint32)
+    x = (words & 0x3FF).astype(np.float64) / 1023.0
+    y = ((words >> 10) & 0x3FF).astype(np.float64) / 1023.0
+    alpha = ((words >> 30) & 0x3).astype(np.float64) / 3.0
+    normal_z = np.clip(alpha * 3.0 - 1.0, 0.0, 1.0)
+    return _decode_azimuthal_array(x, y, normal_z)
+
+
+def _decode_packed_tangent_array(words, position_w):
+    words = np.asarray(words, dtype=np.uint32)
+    position_w = np.abs(np.asarray(position_w, dtype=np.int64))
+    tangent_x = ((words >> 20) & 0x3FF).astype(np.float64) / 1023.0
+    tangent_y = (position_w & 0x3FF).astype(np.float64) / 1023.0
+    nt_zs = ((words >> 30) & 0x3).astype(np.float64)
+    normal_z = np.clip(nt_zs - 1.0, 0.0, 1.0)
+    tangent_z = nt_zs - normal_z * 2.0
+    return _decode_azimuthal_array(tangent_x, tangent_y, tangent_z)
+
+
 def _engine_delta_to_blender(delta):
     return (float(delta[0]), -float(delta[2]), float(delta[1]))
 
@@ -367,13 +411,21 @@ def _store_model_metadata(arm, filepath, data, blocks, sb_offset, source_had_stg
 
 def _set_mesh_uv_layer(mesh, layer_name, vertex_indices, vertex_uvs):
     uv_layer = mesh.uv_layers.new(name=layer_name)
+    loop_count = len(uv_layer.data)
     if vertex_uvs is None or len(vertex_uvs) == 0:
-        for item in uv_layer.data:
-            item.uv = _engine_uv_to_blender((0.0, 0.0))
+        # _engine_uv_to_blender((0, 0)) is (0.0, 1.0).
+        flat = np.empty(loop_count * 2, dtype=np.float32)
+        flat[0::2] = 0.0
+        flat[1::2] = 1.0
+        uv_layer.data.foreach_set("uv", flat)
         return
-    for loop_index, vertex_index in enumerate(vertex_indices):
-        uv = vertex_uvs[int(vertex_index)]
-        uv_layer.data[loop_index].uv = _engine_uv_to_blender(uv)
+    # float64 math then a single narrowing to float32 keeps this bit-identical
+    # to the per-loop `_engine_uv_to_blender` assignment it replaces.
+    per_loop = np.asarray(vertex_uvs)[np.asarray(vertex_indices)].astype(np.float64)
+    flat = np.empty(loop_count * 2, dtype=np.float64)
+    flat[0::2] = per_loop[:loop_count, 0]
+    flat[1::2] = 1.0 - per_loop[:loop_count, 1]
+    uv_layer.data.foreach_set("uv", flat.astype(np.float32))
 
 
 class ImportEngineModel(Operator, ImportHelper):
@@ -434,41 +486,59 @@ class ImportEngineModel(Operator, ImportHelper):
     def execute(self, context):
         filepaths = self._resolve_filepaths()
         if not filepaths:
-            self.report({'ERROR'}, "No file selected. Pick at least one .model file to import.")
+            self.report({'ERROR'}, "Choose at least one .model file, then click Import again.")
             return {'CANCELLED'}
 
         wm = context.window_manager
         wm.progress_begin(0, 100)
         success_count = 0
         failure_messages = []
+        reported_failure_count = 0
         try:
             total = len(filepaths)
             for index, filepath in enumerate(filepaths):
                 if not os.path.isfile(filepath):
-                    failure_messages.append(f"{os.path.basename(filepath) or filepath}: file not found")
+                    failure_messages.append(
+                        f"{os.path.basename(filepath) or filepath}: the file was moved or deleted; choose it again"
+                    )
                     continue
                 try:
                     result = self._do_import(context, wm, filepath)
                 except Exception as exc:
                     log_exception("Unexpected error importing model %s", filepath)
-                    failure_messages.append(f"{os.path.basename(filepath)}: {exc}")
+                    failure_messages.append(
+                        f"{os.path.basename(filepath)}: couldn't be read; make sure it is an original "
+                        "extracted game model"
+                    )
                     continue
                 if result == {'FINISHED'}:
                     success_count += 1
                 else:
-                    failure_messages.append(f"{os.path.basename(filepath)}: import cancelled")
+                    reported_failure_count += 1
+                    failure_messages.append(
+                        f"{os.path.basename(filepath)}: couldn't be imported; follow the message shown above"
+                    )
                 if total > 1:
                     wm.progress_update(int(100 * ((index + 1) / total)))
         finally:
             wm.progress_end()
 
         if success_count == 0:
+            if reported_failure_count == len(failure_messages):
+                return {'CANCELLED'}
             detail = "; ".join(failure_messages) if failure_messages else "no files imported"
-            self.report({'ERROR'}, f"Model import failed: {detail}")
+            self.report(
+                {'ERROR'},
+                f"I couldn't import this model. {detail}. Choose an original game .model file and try again.",
+            )
             return {'CANCELLED'}
 
         if failure_messages:
-            self.report({'WARNING'}, f"Imported {success_count}/{len(filepaths)} models. Skipped: {'; '.join(failure_messages)}")
+            self.report(
+                {'WARNING'},
+                f"Imported {success_count} of {len(filepaths)} models. These files still need attention: "
+                f"{'; '.join(failure_messages)}. Choose those files again after fixing the issue.",
+            )
         else:
             self.report({'INFO'}, f"Imported {success_count} model{'s' if success_count != 1 else ''}.")
         return {'FINISHED'}
@@ -476,12 +546,20 @@ class ImportEngineModel(Operator, ImportHelper):
     def _do_import(self, context, wm, filepath):
         data, blocks, sb_offset = get_dat1_data(filepath)
         if not data:
-            self.report({'ERROR'}, f"{os.path.basename(filepath)}: invalid DAT1 magic signature not found.")
+            self.report(
+                {'ERROR'},
+                f"{os.path.basename(filepath)} isn't a supported game model. Choose the original extracted "
+                ".model file, not a renamed or converted file.",
+            )
             return {'CANCELLED'}
         required_model_blocks = ("ModelBuilt", "ModelMaterial", "ModelLook", "ModelLookBuilt", "ModelLookGroup", "ModelSubset", "ModelSubsetGeomData")
         missing_model_blocks = [name for name in required_model_blocks if BLOCK_HASHES[name] not in blocks]
         if missing_model_blocks:
-            self.report({'ERROR'}, f"{os.path.basename(filepath)}: file does not contain Model data ({', '.join(missing_model_blocks)} missing).")
+            self.report(
+                {'ERROR'},
+                f"{os.path.basename(filepath)} doesn't contain a complete game model. Choose a different "
+                f"original .model file. Missing internal data: {', '.join(missing_model_blocks)}.",
+            )
             return {'CANCELLED'}
 
         wm.progress_update(5)
@@ -592,6 +670,19 @@ class ImportEngineModel(Operator, ImportHelper):
             joint_count,
             len(imported_materials),
         )
+        if BLOCK_HASHES["ModelStrandSubsets"] in blocks:
+            try:
+                created_hair = import_strand_hair(filepath, arm, context)
+                arm["engine_model_source_has_hair"] = True
+                if created_hair:
+                    total_strands = sum(len(obj.data.curves) for obj in created_hair)
+                    self.report(
+                        {'INFO'},
+                        f"Also imported {len(created_hair)} hair part(s) with {total_strands} total strands.",
+                    )
+            except Exception:
+                log_exception(f"{filepath}: strand hair import failed, continuing without it")
+                arm["engine_model_source_has_hair"] = False
         arm["engine_model_import_all_lods"] = bool(import_all_lods)
         arm["engine_model_import_mode"] = "ALL_LODS" if import_all_lods else "LOD0"
         arm["engine_model_imported_subset_count"] = 0
@@ -706,17 +797,45 @@ class ImportEngineModel(Operator, ImportHelper):
                 me.validate(verbose=False)
 
                 vertex_normals = []
+                normal_tangents = []
                 position_ws = []
                 for vertex_index in range(vtx_count):
                     raw_vertex = struct.unpack_from("<hhhhIhh", data, v_base + vertex_index * 16)
                     engine_normal = _decode_packed_normal(raw_vertex[4])
                     vertex_normals.append((engine_normal[0], -engine_normal[2], engine_normal[1]))
+                    normal_tangent = int(raw_vertex[4]) & U32_MASK
+                    normal_tangents.append(
+                        normal_tangent if normal_tangent < 0x80000000 else normal_tangent - 0x100000000
+                    )
                     position_ws.append(int(raw_vertex[3]))
                 me.normals_split_custom_set([
                     vertex_normals[int(mesh_loop.vertex_index)] for mesh_loop in me.loops
                 ])
                 position_w_attr = me.attributes.new(name="engine_position_w", type='INT', domain='POINT')
                 position_w_attr.data.foreach_set("value", position_ws)
+                normal_tangent_attr = me.attributes.new(
+                    name="engine_source_normal_tangent",
+                    type='INT',
+                    domain='POINT',
+                )
+                normal_tangent_attr.data.foreach_set("value", normal_tangents)
+                source_position_attr = me.attributes.new(
+                    name="engine_source_position",
+                    type='FLOAT_VECTOR',
+                    domain='POINT',
+                )
+                source_position_attr.data.foreach_set("vector", verts_flat)
+                source_uv0_u_attr = me.attributes.new(name="engine_source_uv0_u", type='FLOAT', domain='POINT')
+                source_uv0_v_attr = me.attributes.new(name="engine_source_uv0_v", type='FLOAT', domain='POINT')
+                source_uv0_u_attr.data.foreach_set("value", uv0[:, 0])
+                source_uv0_v_attr.data.foreach_set("value", uv0[:, 1])
+                me.calc_loop_triangles()
+                me["engine_source_topology_signature"] = model_topology_signature(
+                    mesh_triangle_vertex_indices(me)
+                )
+                me["engine_source_corner_normal_signature"] = model_corner_normal_signature(
+                    me.corner_normals
+                )
 
                 obj = bpy.data.objects.new(f"Subset_{s}", me)
                 context.collection.objects.link(obj)
@@ -817,7 +936,11 @@ class ImportEngineModel(Operator, ImportHelper):
                         ),
                     )
                     imported_ziva_keys = int(ziva_result["created"])
-                    arm["engine_ziva_mode"] = "CUSTOM_MORPH2"
+                    # These keys are an editable Blender preview of the source
+                    # solver.  An untouched import should keep the exact Ziva
+                    # runtime path; explicit custom-transfer tools opt in to
+                    # the approximate Morph2 replacement instead.
+                    arm["engine_ziva_mode"] = "SOURCE_ZIVA"
                     arm["engine_model_shape_keys_imported"] = True
                     arm["engine_model_ziva_shape_keys_imported"] = True
                     arm["engine_model_morph_target_count"] = int(len(ziva_model.sliders))
@@ -829,15 +952,20 @@ class ImportEngineModel(Operator, ImportHelper):
         arm.active_lod = 0
         update_lod_visibility(arm, context)
         wm.progress_update(100)
-        mode_label = "all LODs" if import_all_lods else "LOD0"
+        mode_label = "mesh parts from all detail levels" if import_all_lods else "main mesh parts"
         imported_count = int(arm.get("engine_model_imported_subset_count", 0))
-        morph_label = ""
+        shape_label = ""
         if import_shape_keys and has_morphs:
-            morph_label = f", {int(arm.get('engine_model_imported_morph_key_count', 0))} shape-key instances"
-        elif import_shape_keys and has_ziva and ziva_model is not None and ziva_model.sliders:
-            morph_label = (
-                f", {int(arm.get('engine_model_imported_ziva_key_count', 0))} Ziva shape-key instances "
-                f"across {len(ziva_model.sliders)} shared controls"
+            shape_label = (
+                f", plus {int(arm.get('engine_model_imported_morph_key_count', 0))} facial shape-key copies"
             )
-        self.report({'INFO'}, f"Imported model with {joint_count} joints, {imported_count} {mode_label} subset(s){morph_label}")
+        elif import_shape_keys and has_ziva and ziva_model is not None and ziva_model.sliders:
+            shape_label = (
+                f", plus {int(arm.get('engine_model_imported_ziva_key_count', 0))} facial shape-key copies "
+                f"using {len(ziva_model.sliders)} controls"
+            )
+        self.report(
+            {'INFO'},
+            f"Import finished: {joint_count} bones and {imported_count} {mode_label}{shape_label}.",
+        )
         return {'FINISHED'}
