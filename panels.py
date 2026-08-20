@@ -392,6 +392,9 @@ def _draw_model_dat1_panel(layout, arm):
     grid.label(text=f"Subsets: {int(arm.get('engine_model_subset_count', 0))}")
     grid.label(text=f"Materials: {int(arm.get('engine_model_material_count', 0))}")
     grid.label(text=f"Joints: {int(arm.get('engine_model_joint_count', 0))}")
+    if str(arm.get("engine_model_format", "")) == "MSMR":
+        grid.label(text=f"Joint Lookups: {int(arm.get('engine_model_joint_lookup_count', 0))}")
+        grid.label(text=f"Mirror Pairs: {int(arm.get('engine_model_mirror_pair_count', 0))}")
     grid.label(text=f"Geom Off: {int(arm.get('engine_model_geom_offset', 0))}")
 
 
