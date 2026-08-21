@@ -2,6 +2,7 @@
 # Behavior-sensitive logic was moved mechanically; avoid algorithm changes here.
 
 from .utils import *
+from .model_hair import import_strand_hair
 from .model_morph import decode_model_morph2, sync_armature_morph_controls
 from .model_msmr import (
     MSMR_MODEL_STD_VERT_HASH,
@@ -111,6 +112,38 @@ def _decode_packed_tangent(word, position_w):
     return _decode_azimuthal(tangent_x, tangent_y, tangent_z)
 
 
+def _decode_azimuthal_array(x, y, z_sign):
+    enc_x = x * (4.0 / 1.41421356) - (2.0 / 1.41421356)
+    enc_y = y * (4.0 / 1.41421356) - (2.0 / 1.41421356)
+    f = enc_x * enc_x + enc_y * enc_y
+    xy_scale = np.sqrt(np.maximum(0.0, 1.0 - f * 0.25))
+    z = np.abs(1.0 - f * 0.5)
+    z = np.where(z_sign < 0.5, -z, z)
+    out = np.empty((len(enc_x), 3), dtype=np.float64)
+    out[:, 0] = enc_x * xy_scale
+    out[:, 1] = enc_y * xy_scale
+    out[:, 2] = z
+    return out
+
+
+def _decode_packed_normal_array(words):
+    words = np.asarray(words, dtype=np.uint32)
+    x = (words & 0x3FF).astype(np.float64) / 1023.0
+    y = ((words >> 10) & 0x3FF).astype(np.float64) / 1023.0
+    alpha = ((words >> 30) & 0x3).astype(np.float64) / 3.0
+    normal_z = np.clip(alpha * 3.0 - 1.0, 0.0, 1.0)
+    return _decode_azimuthal_array(x, y, normal_z)
+
+
+def _decode_packed_tangent_array(words, position_w):
+    words = np.asarray(words, dtype=np.uint32)
+    position_w = np.abs(np.asarray(position_w, dtype=np.int64))
+    tangent_x = ((words >> 20) & 0x3FF).astype(np.float64) / 1023.0
+    tangent_y = (position_w & 0x3FF).astype(np.float64) / 1023.0
+    nt_zs = ((words >> 30) & 0x3).astype(np.float64)
+    normal_z = np.clip(nt_zs - 1.0, 0.0, 1.0)
+    tangent_z = nt_zs - normal_z * 2.0
+    return _decode_azimuthal_array(tangent_x, tangent_y, tangent_z)
 def _engine_delta_to_blender(delta):
     return (float(delta[0]), -float(delta[2]), float(delta[1]))
 
@@ -419,13 +452,21 @@ def _store_model_metadata(arm, filepath, data, blocks, sb_offset, source_had_stg
 
 def _set_mesh_uv_layer(mesh, layer_name, vertex_indices, vertex_uvs):
     uv_layer = mesh.uv_layers.new(name=layer_name)
+    loop_count = len(uv_layer.data)
     if vertex_uvs is None or len(vertex_uvs) == 0:
-        for item in uv_layer.data:
-            item.uv = _engine_uv_to_blender((0.0, 0.0))
+        # _engine_uv_to_blender((0, 0)) is (0.0, 1.0).
+        flat = np.empty(loop_count * 2, dtype=np.float32)
+        flat[0::2] = 0.0
+        flat[1::2] = 1.0
+        uv_layer.data.foreach_set("uv", flat)
         return
-    for loop_index, vertex_index in enumerate(vertex_indices):
-        uv = vertex_uvs[int(vertex_index)]
-        uv_layer.data[loop_index].uv = _engine_uv_to_blender(uv)
+    # float64 math then a single narrowing to float32 keeps this bit-identical
+    # to the per-loop `_engine_uv_to_blender` assignment it replaces.
+    per_loop = np.asarray(vertex_uvs)[np.asarray(vertex_indices)].astype(np.float64)
+    flat = np.empty(loop_count * 2, dtype=np.float64)
+    flat[0::2] = per_loop[:loop_count, 0]
+    flat[1::2] = 1.0 - per_loop[:loop_count, 1]
+    uv_layer.data.foreach_set("uv", flat.astype(np.float32))
 
 
 def _set_msmr_color_attributes(mesh, packed_colors, packed_words):
@@ -1222,6 +1263,21 @@ class ImportEngineModel(Operator, ImportHelper):
             arm["engine_model_joint_lookup_count"] = 0
             arm["engine_model_mirror_record_count"] = 0
             arm["engine_model_mirror_pair_count"] = 0
+        # MSMR uses the same block hash for its older spline layout; that is
+        # decoded separately below by _import_msmr_splines.
+        if not msmr and BLOCK_HASHES["ModelStrandSubsets"] in blocks:
+            try:
+                created_hair = import_strand_hair(filepath, arm, context)
+                arm["engine_model_source_has_hair"] = True
+                if created_hair:
+                    total_strands = sum(len(obj.data.curves) for obj in created_hair)
+                    self.report(
+                        {'INFO'},
+                        f"Also imported {len(created_hair)} hair part(s) with {total_strands} total strands.",
+                    )
+            except Exception:
+                log_exception(f"{filepath}: strand hair import failed, continuing without it")
+                arm["engine_model_source_has_hair"] = False
         arm["engine_model_import_all_lods"] = bool(import_all_lods)
         arm["engine_model_import_mode"] = "ALL_LODS" if import_all_lods else "LOD0"
         arm["engine_model_imported_subset_count"] = 0
@@ -1384,9 +1440,7 @@ class ImportEngineModel(Operator, ImportHelper):
                 source_uv0_v_attr.data.foreach_set("value", uv0[:, 1])
                 me.calc_loop_triangles()
                 me["engine_source_topology_signature"] = model_topology_signature(
-                    int(me.loops[loop_index].vertex_index)
-                    for triangle in me.loop_triangles
-                    for loop_index in triangle.loops
+                    mesh_triangle_vertex_indices(me)
                 )
                 me["engine_source_corner_normal_signature"] = model_corner_normal_signature(
                     me.corner_normals
@@ -1491,6 +1545,9 @@ class ImportEngineModel(Operator, ImportHelper):
                     ),
                 )
                 imported_ziva_keys = int(ziva_result["created"])
+                # These keys are an editable Blender preview of the source
+                # solver. An untouched import keeps the exact Ziva runtime
+                # path; custom transfers opt in to the Morph2 replacement.
                 arm["engine_ziva_mode"] = "SOURCE_ZIVA"
                 arm["engine_model_shape_keys_imported"] = True
                 arm["engine_model_ziva_shape_keys_imported"] = True

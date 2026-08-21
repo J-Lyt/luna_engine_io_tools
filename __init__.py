@@ -25,6 +25,7 @@ _MODULE_NAMES = (
     "model_ziva",
     "model_morph",
     "model_msmr",
+    "model_hair",
     "model_import",
     "model_export",
     "anim_import",

@@ -1,3 +1,5 @@
+from operator import itemgetter
+
 from .utils import *
 from .constants import SUBSET_CENTER_LOG_SCALE
 from .dat1 import DAT1_BLOCK_TABLE_ENTRY_SIZE, DAT1_FILE_ID, DAT1_FIXUP_TABLE_ENTRY_SIZE, DAT1_HEADER_SIZE
@@ -450,11 +452,17 @@ def _primary_material_for_object(obj):
     materials = list(getattr(mesh, "materials", []) or []) if mesh else []
     if not materials:
         return None
-    used = {}
-    for poly in getattr(mesh, "polygons", []) or []:
-        used[int(poly.material_index)] = used.get(int(poly.material_index), 0) + 1
-    if used:
-        index = max(used.items(), key=lambda item: item[1])[0]
+    polygons = getattr(mesh, "polygons", None)
+    polygon_count = len(polygons) if polygons is not None else 0
+    if polygon_count:
+        material_indices = np.empty(polygon_count, dtype=np.int32)
+        polygons.foreach_get("material_index", material_indices)
+        values, first_seen, counts = np.unique(
+            material_indices, return_index=True, return_counts=True
+        )
+        # ?
+        appearance = np.argsort(first_seen)
+        index = int(values[appearance[int(np.argmax(counts[appearance]))]])
         if 0 <= index < len(materials):
             return materials[index]
     return materials[0]
@@ -610,10 +618,7 @@ def _friendly_export_error(exc):
     message = str(exc or "").strip()
     if isinstance(exc, ValueError) and message:
         return message
-    return (
-        "Something unexpected stopped the export. Re-import the original .model file and try again. "
-        "If it keeps happening, share the .blend file and original .model file with the add-on developer."
-    )
+    return "Something unexpected stopped the export. Re-import the original .model file and try again."
 
 
 def _uv_name_slot(name):
@@ -760,22 +765,6 @@ def _uv_layer_by_name_or_index(mesh, name, index):
     return None
 
 
-def _loop_uv(layer, loop_index):
-    if not layer:
-        return (0.0, 0.0)
-    uv = layer.data[loop_index].uv
-    return (float(uv.x), 1.0 - float(uv.y))
-
-
-def _uv_nearly_equal(left, right, threshold=0.0001):
-    if left is None or right is None:
-        return left is None and right is None
-    return (
-        abs(float(left[0]) - float(right[0])) <= threshold
-        and abs(float(left[1]) - float(right[1])) <= threshold
-    )
-
-
 def _linear_matrix_is_identity(matrix, threshold=1.0e-7):
     for row in range(3):
         for column in range(3):
@@ -801,11 +790,7 @@ def _source_model_basis(mesh, uv0_layer, basis_coords):
         attributes[name] = attribute.data
 
     expected_signature = str(mesh.get("engine_source_topology_signature", "") or "")
-    current_signature = model_topology_signature(
-        int(mesh.loops[loop_index].vertex_index)
-        for triangle in mesh.loop_triangles
-        for loop_index in triangle.loops
-    )
+    current_signature = model_topology_signature(mesh_triangle_vertex_indices(mesh))
     if not expected_signature or current_signature != expected_signature:
         return None
 
@@ -816,75 +801,77 @@ def _source_model_basis(mesh, uv0_layer, basis_coords):
         return None
 
     source_positions = attributes["engine_source_position"]
-    for vertex_index, vertex in enumerate(mesh.vertices):
-        current = basis_coords[vertex_index] if basis_coords is not None else vertex.co
-        source = source_positions[vertex_index].vector
-        if any(abs(float(current[axis]) - float(source[axis])) > 1.0e-7 for axis in range(3)):
-            return None
+    source_position_values = np.empty(vertex_count * 3, dtype=np.float64)
+    source_positions.foreach_get("vector", source_position_values)
+    if basis_coords is not None:
+        current_positions = np.asarray(basis_coords, dtype=np.float64).reshape(-1)
+    else:
+        current_positions = np.empty(vertex_count * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", current_positions)
+    if np.any(np.abs(current_positions - source_position_values) > 1.0e-7):
+        return None
 
-    source_words = attributes["engine_source_normal_tangent"]
     source_uv0_u = attributes["engine_source_uv0_u"]
     source_uv0_v = attributes["engine_source_uv0_v"]
-    normal_mismatch_count = 0
-    normal_mismatch_limit = max(4, int(len(mesh.loops) * 0.001))
-    for loop_index, loop in enumerate(mesh.loops):
-        vertex_index = int(loop.vertex_index)
-        current_uv = _loop_uv(uv0_layer, loop_index)
-        source_uv = (
-            float(source_uv0_u[vertex_index].value),
-            float(source_uv0_v[vertex_index].value),
-        )
-        if not _uv_nearly_equal(current_uv, source_uv, threshold=1.0e-7):
+    loop_count = len(mesh.loops)
+    loop_vertex_indices = np.empty(loop_count, dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertex_indices)
+
+    source_u = np.empty(vertex_count, dtype=np.float64)
+    source_v = np.empty(vertex_count, dtype=np.float64)
+    source_uv0_u.foreach_get("value", source_u)
+    source_uv0_v.foreach_get("value", source_v)
+
+    if uv0_layer:
+        current_uv_flat = np.empty(loop_count * 2, dtype=np.float64)
+        uv0_layer.data.foreach_get("uv", current_uv_flat)
+        current_u = current_uv_flat[0::2]
+        current_v = 1.0 - current_uv_flat[1::2]
+    else:
+        current_u = np.zeros(loop_count, dtype=np.float64)
+        current_v = np.zeros(loop_count, dtype=np.float64)
+
+    if np.any(np.abs(current_u - source_u[loop_vertex_indices]) > 1.0e-7) or np.any(
+        np.abs(current_v - source_v[loop_vertex_indices]) > 1.0e-7
+    ):
+        return None
+
+    if not expected_normal_signature:
+        source_words = np.empty(vertex_count, dtype=np.int32)
+        attributes["engine_source_normal_tangent"].foreach_get("value", source_words)
+        decoded = _decode_packed_normal_array(source_words.astype(np.uint32))
+        source_normals = np.empty_like(decoded)
+        source_normals[:, 0] = decoded[:, 0]
+        source_normals[:, 1] = -decoded[:, 2]
+        source_normals[:, 2] = decoded[:, 1]
+
+        current_normals = np.empty(loop_count * 3, dtype=np.float64)
+        mesh.corner_normals.foreach_get("vector", current_normals)
+        current_normals = current_normals.reshape(-1, 3)
+
+        # Blender normalizes custom split normals when assigning them
+        dots = np.einsum("ij,ij->i", current_normals, source_normals[loop_vertex_indices])
+        normal_mismatch_limit = max(4, int(loop_count * 0.001))
+        if int(np.count_nonzero(dots < 0.99999)) > normal_mismatch_limit:
             return None
-
-        if expected_normal_signature:
-            continue
-
-        source_normal_engine = _decode_packed_normal(int(source_words[vertex_index].value) & U32_MASK)
-        source_normal_blender = (
-            float(source_normal_engine[0]),
-            -float(source_normal_engine[2]),
-            float(source_normal_engine[1]),
-        )
-        current_normal = mesh.corner_normals[loop_index].vector
-        current_normal_tuple = (
-            float(current_normal.x),
-            float(current_normal.y),
-            float(current_normal.z),
-        )
-
-        if _vec_dot(current_normal_tuple, source_normal_blender) < 0.99999:
-            normal_mismatch_count += 1
-
-            if normal_mismatch_count > normal_mismatch_limit:
-                return None
 
     return attributes
 
 
-def _luna_export_vertex_matches(candidate, normal, tangent, tangent_flip, uv0, uv1, uv2):
-    if _vec_dot(candidate["normal"], normal) < (1.0 - 0.002):
-        return False
-    if _vec_dot(candidate["tangent"], tangent) < (1.0 - 1.6):
-        return False
-    if (candidate["tangent_flip"] >= 0.0) != (float(tangent_flip) >= 0.0):
-        return False
-    return (
-        _uv_nearly_equal(candidate.get("uv0"), uv0)
-        and _uv_nearly_equal(candidate.get("uv1"), uv1)
-        and _uv_nearly_equal(candidate.get("uv2"), uv2)
-    )
+VERTEX_MATCH_NORMAL_DOT_MIN = 1.0 - 0.002
+VERTEX_MATCH_TANGENT_DOT_MIN = 1.0 - 1.6
+VERTEX_MATCH_UV_THRESHOLD = 0.0001
 
 
 def _vertex_group_joint_map(obj, arm):
     if not arm:
         return {}
     bone_names = {}
-    for index, bone in enumerate(getattr(arm.data, "bones", []) or []):
+    for bone in getattr(arm.data, "bones", []) or []:
         try:
-            engine_index = int(bone.get("engine_joint_index", index))
+            engine_index = int(bone.get("engine_joint_index", -1))
         except Exception:
-            engine_index = index
+            engine_index = -1
         bone_names[bone.name] = engine_index
     result = {}
     for group in getattr(obj, "vertex_groups", []) or []:
@@ -895,10 +882,9 @@ def _vertex_group_joint_map(obj, arm):
 
 def _vertex_weights(mesh_vertex, obj, group_to_joint, source_joint_count):
     weights = []
-    if not group_to_joint:
-        return weights
+    lookup_joint = group_to_joint.get
     for group_elem in getattr(mesh_vertex, "groups", []) or []:
-        joint_index = group_to_joint.get(int(group_elem.group))
+        joint_index = lookup_joint(int(group_elem.group))
         if joint_index is None:
             continue
         weight = float(group_elem.weight)
@@ -910,7 +896,7 @@ def _vertex_weights(mesh_vertex, obj, group_to_joint, source_joint_count):
                     "then export again."
                 )
             weights.append((joint_index, weight))
-    weights.sort(key=lambda item: item[1], reverse=True)
+    weights.sort(key=itemgetter(1), reverse=True)
     return weights[:12]
 
 
@@ -1037,6 +1023,110 @@ def _order_export_vertices_by_control_point(vertices, indices, control_vertex_co
     return [vertices[index] for index in order], [remap[int(index)] for index in indices]
 
 
+def _prefetch_loop_uvs(layer, loop_count):
+    if not layer:
+        return [(0.0, 0.0)] * loop_count
+    flat = np.empty(loop_count * 2, dtype=np.float64)
+    layer.data.foreach_get("uv", flat)
+    return list(zip(flat[0::2].tolist(), (1.0 - flat[1::2]).tolist()))
+
+
+def _prefetch_engine_positions(mesh, matrix, basis_coords, vertex_count):
+    if _matrix_is_identity_4x4(matrix):
+        if basis_coords is not None:
+            coords = np.asarray(basis_coords, dtype=np.float32).astype(np.float64)
+        else:
+            raw = np.empty(vertex_count * 3, dtype=np.float64)
+            mesh.vertices.foreach_get("co", raw)
+            coords = raw.reshape(-1, 3)
+        return list(zip(
+            coords[:, 0].tolist(),
+            coords[:, 2].tolist(),
+            (-coords[:, 1]).tolist(),
+        ))
+    if basis_coords is not None:
+        return [
+            _blender_to_engine_vec(matrix @ mathutils.Vector(basis_coords[index]))
+            for index in range(vertex_count)
+        ]
+    return [_blender_to_engine_vec(matrix @ vertex.co) for vertex in mesh.vertices]
+
+
+def _matrix_is_identity_4x4(matrix):
+    try:
+        for row in range(4):
+            for column in range(4):
+                expected = 1.0 if row == column else 0.0
+                if float(matrix[row][column]) != expected:
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def _normalize_engine_rows(rows):
+    x = rows[:, 0]
+    y = rows[:, 1]
+    z = rows[:, 2]
+    length = np.sqrt(np.maximum(0.0, x * x + y * y + z * z))
+    usable = length > 1.0e-8
+    safe = np.where(usable, length, 1.0)
+    xs = (x / safe).tolist()
+    ys = (y / safe).tolist()
+    zs = (z / safe).tolist()
+    flags = usable.tolist()
+    return [
+        (xs[index], ys[index], zs[index]) if flags[index] else None
+        for index in range(len(flags))
+    ]
+
+
+def _engine_frame_rows(decoded, transform, transform_is_identity):
+    if transform_is_identity:
+        narrowed = decoded.astype(np.float32).astype(np.float64)
+        return np.column_stack((narrowed[:, 0], narrowed[:, 1], narrowed[:, 2]))
+    rows = np.empty_like(decoded)
+    for index in range(len(decoded)):
+        blender_vector = mathutils.Vector((
+            float(decoded[index][0]),
+            -float(decoded[index][2]),
+            float(decoded[index][1]),
+        ))
+        rows[index] = _blender_to_engine_vec(transform @ blender_vector)
+    return rows
+
+
+def _prefetch_source_basis_frames(
+    source_basis,
+    vertex_count,
+    normal_matrix,
+    linear_matrix,
+    normal_matrix_identity,
+    linear_matrix_identity,
+    tangent_flip_transform,
+):
+    words_signed = np.empty(vertex_count, dtype=np.int32)
+    source_basis["engine_source_normal_tangent"].foreach_get("value", words_signed)
+    position_w = np.empty(vertex_count, dtype=np.int32)
+    source_basis["engine_position_w"].foreach_get("value", position_w)
+
+    words = words_signed.astype(np.uint32)
+    normals = _engine_frame_rows(
+        _decode_packed_normal_array(words), normal_matrix, normal_matrix_identity
+    )
+    tangents = _engine_frame_rows(
+        _decode_packed_tangent_array(words, position_w), linear_matrix, linear_matrix_identity
+    )
+    flips = np.where(position_w >= 0, 1.0, -1.0) * tangent_flip_transform
+    return (
+        words.tolist(),
+        position_w.tolist(),
+        _normalize_engine_rows(normals),
+        _normalize_engine_rows(tangents),
+        flips.tolist(),
+    )
+
+
 def _export_mesh_vertices(
     obj,
     arm,
@@ -1122,68 +1212,133 @@ def _export_mesh_vertices(
         tangent_flip_transform = 1.0
 
     export_vertices = []
+    match_keys = []
     vertex_buckets = {}
     indices = []
 
-    for triangle in mesh.loop_triangles:
-        triangle_loops = tuple(int(loop_index) for loop_index in triangle.loops)
-        triangle_positions = []
-        triangle_uv0s = []
-        for loop_index in triangle_loops:
-            source_vertex_index = int(mesh.loops[loop_index].vertex_index)
-            source_co = (
-                mathutils.Vector(basis_coords[source_vertex_index])
-                if basis_coords is not None else mesh.vertices[source_vertex_index].co
-            )
-            triangle_positions.append(_blender_to_engine_vec(matrix @ source_co))
-            triangle_uv0s.append(_loop_uv(uv0_layer, loop_index))
-        triangle_tangent, triangle_tangent_flip = _luna_triangle_tangent_space(
-            triangle_positions,
-            triangle_uv0s,
+    vertex_count = len(mesh.vertices)
+    loop_count = len(mesh.loops)
+    triangle_count = len(mesh.loop_triangles)
+
+    loop_vertex_index = np.empty(loop_count, dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertex_index)
+    loop_vertex_index = loop_vertex_index.tolist()
+
+    triangle_loop_indices = np.empty(triangle_count * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("loops", triangle_loop_indices)
+    triangle_loop_indices = triangle_loop_indices.tolist()
+
+    uv0_values = _prefetch_loop_uvs(uv0_layer, loop_count)
+    uv1_values = _prefetch_loop_uvs(uv1_layer, loop_count) if has_uv1 and uv1_layer else None
+    uv2_values = _prefetch_loop_uvs(uv2_layer, loop_count) if has_uv2 and uv2_layer else None
+
+    positions_engine = _prefetch_engine_positions(mesh, matrix, basis_coords, vertex_count)
+
+    normal_matrix_identity = _linear_matrix_is_identity(normal_matrix, threshold=0.0)
+    corner_normals_raw = []
+
+    source_extrusion = None
+    if source_position_w is not None:
+        extrusion_values = np.empty(vertex_count, dtype=np.int32)
+        source_position_w.foreach_get("value", extrusion_values)
+        source_extrusion = ((np.abs(extrusion_values.astype(np.int64)) >> 10) & 0x1F).tolist()
+
+    source_words = source_ws = source_normals = source_tangents = source_flips = None
+    if source_basis is not None:
+        (
+            source_words,
+            source_ws,
+            source_normals,
+            source_tangents,
+            source_flips,
+        ) = _prefetch_source_basis_frames(
+            source_basis,
+            vertex_count,
+            normal_matrix,
+            linear_matrix,
+            normal_matrix_identity,
+            _linear_matrix_is_identity(linear_matrix, threshold=0.0),
+            tangent_flip_transform,
         )
+
+    weights_cache = {}
+
+    def corner_normal_engine(loop_index):
+        if not corner_normals_raw:
+            values = np.empty(loop_count * 3, dtype=np.float64)
+            mesh.corner_normals.foreach_get("vector", values)
+            corner_normals_raw.extend(values.tolist())
+        base = loop_index * 3
+        raw_x = corner_normals_raw[base]
+        raw_y = corner_normals_raw[base + 1]
+        raw_z = corner_normals_raw[base + 2]
+        if normal_matrix_identity:
+            return _vec_normalize((raw_x, raw_z, -raw_y))
+        return _vec_normalize(
+            _blender_to_engine_vec(normal_matrix @ mathutils.Vector((raw_x, raw_y, raw_z)))
+        )
+
+    for triangle_index in range(triangle_count):
+        base = triangle_index * 3
+        triangle_loops = (
+            triangle_loop_indices[base],
+            triangle_loop_indices[base + 1],
+            triangle_loop_indices[base + 2],
+        )
+        triangle_vertices = (
+            loop_vertex_index[triangle_loops[0]],
+            loop_vertex_index[triangle_loops[1]],
+            loop_vertex_index[triangle_loops[2]],
+        )
+        triangle_positions = (
+            positions_engine[triangle_vertices[0]],
+            positions_engine[triangle_vertices[1]],
+            positions_engine[triangle_vertices[2]],
+        )
+        triangle_basis = None
+
         tri_indices = []
-        for triangle_corner, loop_index in enumerate(triangle_loops):
-            loop = mesh.loops[loop_index]
-            source_vertex_index = int(loop.vertex_index)
-            uv0 = _loop_uv(uv0_layer, loop_index)
-            uv1 = _loop_uv(uv1_layer, loop_index) if has_uv1 and uv1_layer else None
-            uv2 = _loop_uv(uv2_layer, loop_index) if has_uv2 and uv2_layer else None
-            # Preserve Blender's split/corner normals. Averaging these by
-            # control point rounds deliberately sharp eye and lens frames.
-            corner_normal = mesh.corner_normals[loop_index].vector
-            normal = _vec_normalize(_blender_to_engine_vec(normal_matrix @ corner_normal))
+        for triangle_corner in range(3):
+            loop_index = triangle_loops[triangle_corner]
+            source_vertex_index = triangle_vertices[triangle_corner]
+            uv0 = uv0_values[loop_index]
+            uv1 = uv1_values[loop_index] if uv1_values is not None else None
+            uv2 = uv2_values[loop_index] if uv2_values is not None else None
             packed_source_basis = None
             if source_basis is not None:
-                source_word = int(
-                    source_basis["engine_source_normal_tangent"][source_vertex_index].value
-                ) & U32_MASK
-                source_w = int(source_basis["engine_position_w"][source_vertex_index].value)
-                source_normal_engine = _decode_packed_normal(source_word)
-                source_normal_blender = mathutils.Vector((
-                    float(source_normal_engine[0]),
-                    -float(source_normal_engine[2]),
-                    float(source_normal_engine[1]),
-                ))
-                normal = _vec_normalize(
-                    _blender_to_engine_vec(normal_matrix @ source_normal_blender),
-                    fallback=normal,
-                )
-                source_tangent_engine = _decode_packed_tangent(source_word, source_w)
-                source_tangent_blender = mathutils.Vector((
-                    float(source_tangent_engine[0]),
-                    -float(source_tangent_engine[2]),
-                    float(source_tangent_engine[1]),
-                ))
-                tangent = _vec_normalize(
-                    _blender_to_engine_vec(linear_matrix @ source_tangent_blender),
-                    fallback=triangle_tangent,
-                )
-                tangent_flip = (1.0 if source_w >= 0 else -1.0) * tangent_flip_transform
+                normal = source_normals[source_vertex_index]
+                if normal is None:
+                    normal = corner_normal_engine(loop_index)
+                tangent = source_tangents[source_vertex_index]
+                if tangent is None:
+                    if triangle_basis is None:
+                        triangle_basis = _luna_triangle_tangent_space(
+                            triangle_positions,
+                            (
+                                uv0_values[triangle_loops[0]],
+                                uv0_values[triangle_loops[1]],
+                                uv0_values[triangle_loops[2]],
+                            ),
+                        )
+                    tangent = triangle_basis[0]
+                tangent_flip = source_flips[source_vertex_index]
                 if source_basis_packed_exact:
-                    packed_source_basis = (source_word, source_w)
+                    packed_source_basis = (
+                        source_words[source_vertex_index],
+                        source_ws[source_vertex_index],
+                    )
             else:
-                tangent = triangle_tangent
-                tangent_flip = triangle_tangent_flip
+                normal = corner_normal_engine(loop_index)
+                if triangle_basis is None:
+                    triangle_basis = _luna_triangle_tangent_space(
+                        triangle_positions,
+                        (
+                            uv0_values[triangle_loops[0]],
+                            uv0_values[triangle_loops[1]],
+                            uv0_values[triangle_loops[2]],
+                        ),
+                    )
+                tangent, tangent_flip = triangle_basis
             tangent_attribute_valid = bool(
                 msmr_tangent is not None
                 and (
@@ -1215,21 +1370,68 @@ def _export_mesh_vertices(
                     tangent_flip = attribute_flip
                     packed_source_basis = None
             extrusion_encoded = 16
-            if source_position_w is not None:
-                extrusion_encoded = (abs(int(source_position_w[source_vertex_index].value)) >> 10) & 0x1F
+            if source_extrusion is not None:
+                extrusion_encoded = source_extrusion[source_vertex_index]
             export_index = None
+            flip_positive = tangent_flip >= 0.0
+            normal_x, normal_y, normal_z = normal
+            tangent_x, tangent_y, tangent_z = tangent
+            uv0_u, uv0_v = uv0
             for candidate_index in vertex_buckets.get(source_vertex_index, ()):
+                key = match_keys[candidate_index]
+                other = key[0]
+                if (
+                    other[0] * normal_x + other[1] * normal_y + other[2] * normal_z
+                    < VERTEX_MATCH_NORMAL_DOT_MIN
+                ):
+                    continue
+                other = key[1]
+                if (
+                    other[0] * tangent_x + other[1] * tangent_y + other[2] * tangent_z
+                    < VERTEX_MATCH_TANGENT_DOT_MIN
+                ):
+                    continue
+                if key[2] != flip_positive:
+                    continue
+                other = key[3]
+                if (
+                    abs(other[0] - uv0_u) > VERTEX_MATCH_UV_THRESHOLD
+                    or abs(other[1] - uv0_v) > VERTEX_MATCH_UV_THRESHOLD
+                ):
+                    continue
+                if uv1 is not None:
+                    other = key[4]
+                    if (
+                        abs(other[0] - uv1[0]) > VERTEX_MATCH_UV_THRESHOLD
+                        or abs(other[1] - uv1[1]) > VERTEX_MATCH_UV_THRESHOLD
+                    ):
+                        continue
+                if uv2 is not None:
+                    other = key[5]
+                    if (
+                        abs(other[0] - uv2[0]) > VERTEX_MATCH_UV_THRESHOLD
+                        or abs(other[1] - uv2[1]) > VERTEX_MATCH_UV_THRESHOLD
+                    ):
+                        continue
+                export_index = candidate_index
                 candidate = export_vertices[candidate_index]
-                if _luna_export_vertex_matches(candidate, normal, tangent, tangent_flip, uv0, uv1, uv2):
-                    export_index = candidate_index
-                    candidate["_normal_sum"] = _vec_add(candidate["_normal_sum"], normal)
-                    candidate["_tangent_sum"] = _vec_add(candidate["_tangent_sum"], tangent)
-                    candidate["_basis_count"] += 1
-                    break
+                candidate["_normal_sum"] = _vec_add(candidate["_normal_sum"], normal)
+                candidate["_tangent_sum"] = _vec_add(candidate["_tangent_sum"], tangent)
+                candidate["_basis_count"] += 1
+                break
             if export_index is None:
-                vertex = mesh.vertices[source_vertex_index]
+                weights = weights_cache.get(source_vertex_index)
+                if weights is None:
+                    weights = _vertex_weights(
+                        mesh.vertices[source_vertex_index],
+                        obj,
+                        group_to_joint,
+                        source_joint_count,
+                    )
+                    weights_cache[source_vertex_index] = weights
                 export_index = len(export_vertices)
                 vertex_buckets.setdefault(source_vertex_index, []).append(export_index)
+                match_keys.append((normal, tangent, flip_positive, uv0, uv1, uv2))
                 export_vertices.append({
                     "source_index": source_vertex_index,
                     "co": triangle_positions[triangle_corner],
@@ -1244,7 +1446,7 @@ def _export_mesh_vertices(
                     "uv0": uv0,
                     "uv1": uv1,
                     "uv2": uv2,
-                    "weights": _vertex_weights(vertex, obj, group_to_joint, source_joint_count),
+                    "weights": list(weights),
                 })
             tri_indices.append(export_index)
         indices.extend(tri_indices)
@@ -1417,10 +1619,10 @@ def _normalize_skin_weights(weights):
         scaled.append([int(joint), base, exact - base])
         running += base
     remainder = 256 - running
-    scaled.sort(key=lambda item: item[2], reverse=True)
+    scaled.sort(key=itemgetter(2), reverse=True)
     for index in range(abs(remainder)):
         scaled[index % len(scaled)][1] += 1 if remainder > 0 else -1
-    scaled.sort(key=lambda item: item[1], reverse=True)
+    scaled.sort(key=itemgetter(1), reverse=True)
     result = [(joint, _clamp(weight, 0, 256)) for joint, weight, _frac in scaled if weight > 0]
     return result or [(int(weights[0][0]), 256)]
 
@@ -1738,26 +1940,24 @@ def _build_subset_geometry_from_data(
 
     center, extents, radius, origin_units, origin_packed, extents_word, needs_origin = _subset_bounds(vertices, mpu)
 
-    std_vertices = bytearray()
+    pack_std_vertex = struct.Struct("<hhhhIhh").pack
+    origin_x, origin_y, origin_z = origin_units[0], origin_units[1], origin_units[2]
+    uv0_scale = _uv_scale(uv0_log)
+    std_vertex_records = []
+    append_std_vertex = std_vertex_records.append
     for vertex in vertices:
         co = vertex["co"]
-        packed_pos = (
-            int(_clamp(int(round(co[0] / mpu)) - origin_units[0], -32768, 32767)),
-            int(_clamp(int(round(co[1] / mpu)) - origin_units[1], -32768, 32767)),
-            int(_clamp(int(round(co[2] / mpu)) - origin_units[2], -32768, 32767)),
-        )
-        normal_tangent = int(vertex["normal_tangent"])
-        uv0 = _pack_uv(vertex.get("uv0", (0.0, 0.0)), uv0_log)
-        std_vertices += struct.pack(
-            "<hhhhIhh",
-            packed_pos[0],
-            packed_pos[1],
-            packed_pos[2],
+        uv0 = vertex.get("uv0", (0.0, 0.0))
+        append_std_vertex(pack_std_vertex(
+            _clamp(int(round(co[0] / mpu)) - origin_x, -32768, 32767),
+            _clamp(int(round(co[1] / mpu)) - origin_y, -32768, 32767),
+            _clamp(int(round(co[2] / mpu)) - origin_z, -32768, 32767),
             int(vertex["position_w"]),
-            normal_tangent,
-            uv0[0],
-            uv0[1],
-        )
+            int(vertex["normal_tangent"]),
+            _clamp_i16(float(uv0[0]) / uv0_scale),
+            _clamp_i16(float(uv0[1]) / uv0_scale),
+        ))
+    std_vertices = b"".join(std_vertex_records)
 
     geom = bytearray()
     vertex_std_offset = 0
@@ -1807,21 +2007,35 @@ def _build_subset_geometry_from_data(
         skin_cluster_offset = len(geom)
         geom += cluster_headers
 
+    reuse_original_stats = False
+    if original_record:
+        try:
+            original_index_count, original_vertex_count = struct.unpack_from("<II", original_record, 0)
+        except Exception:
+            original_index_count = original_vertex_count = -1
+        reuse_original_stats = (
+            original_index_count == len(indices) and original_vertex_count == len(vertices)
+        )
+
     surface_area = 0.0
     uv_area = 0.0
     longest_edge = 0.0
-    for i in range(0, len(indices), 3):
-        a = vertices[indices[i]]
-        b = vertices[indices[i + 1]]
-        c = vertices[indices[i + 2]]
-        surface_area += _triangle_area(a["co"], b["co"], c["co"])
-        uv_area += _triangle_uv_area(a.get("uv0", (0.0, 0.0)), b.get("uv0", (0.0, 0.0)), c.get("uv0", (0.0, 0.0)))
-        longest_edge = max(
-            longest_edge,
-            _vec_len(_vec_sub(a["co"], b["co"])),
-            _vec_len(_vec_sub(b["co"], c["co"])),
-            _vec_len(_vec_sub(c["co"], a["co"])),
-        )
+    if reuse_original_stats:
+        surface_area, uv_area = struct.unpack_from("<ff", original_record, MODEL_SUBSET_SURFACE_AREA_OFFSET)
+        longest_edge = float(struct.unpack_from("<H", original_record, MODEL_SUBSET_LONGEST_EDGE_OFFSET)[0]) * mpu
+    else:
+        for i in range(0, len(indices), 3):
+            a = vertices[indices[i]]
+            b = vertices[indices[i + 1]]
+            c = vertices[indices[i + 2]]
+            surface_area += _triangle_area(a["co"], b["co"], c["co"])
+            uv_area += _triangle_uv_area(a.get("uv0", (0.0, 0.0)), b.get("uv0", (0.0, 0.0)), c.get("uv0", (0.0, 0.0)))
+            longest_edge = max(
+                longest_edge,
+                _vec_len(_vec_sub(a["co"], b["co"])),
+                _vec_len(_vec_sub(b["co"], c["co"])),
+                _vec_len(_vec_sub(c["co"], a["co"])),
+            )
 
     record = bytearray(original_record if original_record else b"\x00" * MODEL_SUBSET_RECORD_SIZE)
     if len(record) < MODEL_SUBSET_RECORD_SIZE:
@@ -1847,15 +2061,6 @@ def _build_subset_geometry_from_data(
     struct.pack_into("<H", record, MODEL_SUBSET_UV_LOG_OFFSET, uv_log_scales)
     struct.pack_into("<f", record, MODEL_SUBSET_MPU_OFFSET, mpu)
     struct.pack_into("<H", record, MODEL_SUBSET_MATERIAL_INDEX_OFFSET, int(material_index) & 0xFFFF)
-    if original_record:
-        try:
-            original_index_count, original_vertex_count = struct.unpack_from("<II", original_record, 0)
-        except Exception:
-            original_index_count = original_vertex_count = -1
-        if original_index_count == len(indices) and original_vertex_count == len(vertices):
-            surface_area, uv_area = struct.unpack_from("<ff", original_record, MODEL_SUBSET_SURFACE_AREA_OFFSET)
-            longest_edge = float(struct.unpack_from("<H", original_record, MODEL_SUBSET_LONGEST_EDGE_OFFSET)[0]) * mpu
-
     struct.pack_into("<f", record, MODEL_SUBSET_SURFACE_AREA_OFFSET, float(surface_area))
     struct.pack_into("<f", record, MODEL_SUBSET_UV_AREA_OFFSET, float(uv_area))
     struct.pack_into("<f", record, MODEL_SUBSET_FADE_OUT_DIST_OFFSET, 0.0)
@@ -1987,6 +2192,7 @@ def _build_geometry_and_subset_blocks(
             subset_records.append(bytes(record))
             subset_stats["indices"] = chunk_indices
             subset_stats["source_subset_index"] = int(old_index)
+            subset_stats["object_name"] = obj.name
             stats.append(subset_stats)
             for target in chunk_morph_targets:
                 name = str(target["name"])
@@ -3954,7 +4160,13 @@ def _build_look_group_block(groups, look_count, string_pool):
     return bytes(struct.pack("<B", len(groups)) + records + indices)
 
 
-def _build_look_blocks(subset_count, string_pool, template, arm=None, subset_index_map=None):
+def _build_look_blocks(
+    subset_count,
+    string_pool,
+    template,
+    arm=None,
+    subset_index_map=None,
+):
     look_name = "default"
     look_name_offset = string_pool.add(look_name)
     look_hash = string_crc32(look_name)
@@ -4513,8 +4725,7 @@ def _rebuild_dat1(
 ):
     if template.fixup_count != 0:
         raise ValueError(
-            "This particular game-model layout is not supported yet. Try a different original .model file. "
-            "If you need this exact model, share the System Console error with the add-on developer."
+            "This particular game model layout is not supported yet. Try a different original .model file."
         )
 
     remove_hashes = set(remove_hashes or ())
@@ -5149,6 +5360,19 @@ class ExportEngineModel(Operator, ExportHelper):
                 BLOCK_HASHES["ModelSubset"]: subset_block,
                 BLOCK_HASHES["ModelSubsetGeomData"]: geom_block,
             }
+            if arm is not None and hair_objects_for_armature(arm):
+                hair_blocks, hair_warnings = compile_export_hair(arm)
+                if hair_blocks:
+                    replacements.update(hair_blocks)
+                    # ModelBuilt.m_StrandSubsetCount cant be zero
+                    subset_count = len(hair_blocks[BLOCK_HASHES["ModelStrandSubsets"]]) // SUBSET_SIZE
+                    model_built = bytearray(replacements[BLOCK_HASHES["ModelBuilt"]])
+                    struct.pack_into(
+                        "<b", model_built, MODEL_BUILT_STRAND_SUBSET_COUNT_OFFSET,
+                        max(0, min(127, subset_count)),
+                    )
+                    replacements[BLOCK_HASHES["ModelBuilt"]] = bytes(model_built)
+                export_warnings.extend(hair_warnings)
             remove_hashes = set()
             if has_morph:
                 replacements[BLOCK_HASHES["ModelAnimVertInfo2"]] = b"\x00" * 40

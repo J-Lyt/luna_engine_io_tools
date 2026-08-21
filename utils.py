@@ -13,13 +13,43 @@ import uuid
 from types import SimpleNamespace
 
 
+try:
+    import numpy as np
+except Exception:
+    np = SimpleNamespace()
+
+
+def _numpy_available():
+    return getattr(np, "ndarray", None) is not None
+
+
+def mesh_triangle_vertex_indices(mesh):
+    triangle_count = len(mesh.loop_triangles)
+    if not _numpy_available():
+        return [
+            int(mesh.loops[loop_index].vertex_index)
+            for triangle in mesh.loop_triangles
+            for loop_index in triangle.loops
+        ]
+    indices = np.empty(triangle_count * 3, dtype=np.int32)
+    if triangle_count:
+        mesh.loop_triangles.foreach_get("vertices", indices)
+    return indices
+
+
 def model_topology_signature(indices):
+    if _numpy_available() and isinstance(indices, np.ndarray):
+        # Matches struct.pack("<{n}I") over the same values.
+        return hashlib.sha1(indices.astype("<u4", copy=False).tobytes()).hexdigest()
     values = tuple(int(index) & 0xFFFFFFFF for index in indices)
     payload = struct.pack(f"<{len(values)}I", *values) if values else b""
     return hashlib.sha1(payload).hexdigest()
 
 
 def model_corner_normal_signature(normals):
+    fast = _corner_normal_signature_fast(normals)
+    if fast is not None:
+        return fast
     digest = hashlib.sha1()
     for normal in normals:
         values = getattr(normal, "vector", normal)
@@ -31,10 +61,25 @@ def model_corner_normal_signature(normals):
     return digest.hexdigest()
 
 
-try:
-    import numpy as np
-except Exception:  
-    np = SimpleNamespace()
+def _corner_normal_signature_fast(normals):
+    if not _numpy_available():
+        return None
+    foreach_get = getattr(normals, "foreach_get", None)
+    if foreach_get is None:
+        return None
+    try:
+        count = len(normals)
+        values = np.empty(count * 3, dtype=np.float32)
+        if count:
+            foreach_get("vector", values)
+        if not np.all(np.isfinite(values)):
+            return None
+        # float64 widening is important to avoid rounding errors that can cause different hashes for the same normals.
+        scaled = np.round(values.astype(np.float64) * 32767.0)
+        np.clip(scaled, -32767.0, 32767.0, out=scaled)
+        return hashlib.sha1(scaled.astype("<i2").tobytes()).hexdigest()
+    except Exception:
+        return None
 
 
 def model_shape_key_delta_signature(basis_key, target_key):
@@ -102,7 +147,7 @@ except Exception:
 try:
     import bpy
     from bpy_extras.io_utils import ImportHelper, ExportHelper
-    from bpy.props import StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty, PointerProperty, CollectionProperty
+    from bpy.props import StringProperty, IntProperty, FloatProperty, FloatVectorProperty, BoolProperty, EnumProperty, PointerProperty, CollectionProperty
     from bpy.types import Operator, Panel, PropertyGroup, OperatorFileListElement
 except Exception:
     def _property_stub(*_args, **_kwargs):
