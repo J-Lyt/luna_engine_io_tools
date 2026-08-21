@@ -159,6 +159,47 @@ def _decode_msmr_vertex_stream(data, offset, size):
     return normal_words, values
 
 
+def encode_msmr_index_stream(indices):
+    """Encode absolute uint16 indexes as MSMR's wrapping delta stream."""
+    values = np.asarray(indices, dtype=np.uint16).reshape(-1)
+    if values.size == 0:
+        return b""
+    previous = np.empty_like(values)
+    previous[0] = np.uint16(0)
+    previous[1:] = values[:-1]
+    deltas = np.subtract(values, previous, dtype=np.uint16)
+    return deltas.astype("<u2", copy=False).tobytes()
+
+
+def encode_msmr_vertex_stream(normal_words, values):
+    """Encode packed normals and six int16 streams in MSMR chunk order."""
+    normal_words = np.asarray(normal_words, dtype=np.uint32).reshape(-1)
+    values = np.asarray(values, dtype=np.int16)
+    if values.ndim != 2 or values.shape[0] != 6:
+        raise ValueError("MSMR vertex encoder expects six int16 value streams")
+    if values.shape[1] != normal_words.size:
+        raise ValueError("MSMR normal and value stream lengths disagree")
+
+    encoded = bytearray()
+    vertices_per_chunk = MSMR_VERTEX_STREAM_MAX_SIZE // 2
+    for start in range(0, normal_words.size, vertices_per_chunk):
+        stop = min(normal_words.size, start + vertices_per_chunk)
+        chunk_normals = normal_words[start:stop]
+        normal_previous = np.empty_like(chunk_normals)
+        normal_previous[0] = np.uint32(0)
+        normal_previous[1:] = chunk_normals[:-1]
+        normal_deltas = np.bitwise_xor(chunk_normals, normal_previous)
+        encoded += normal_deltas.astype("<u4", copy=False).tobytes()
+
+        chunk_values = values[:, start:stop].view(np.uint16)
+        value_previous = np.empty_like(chunk_values)
+        value_previous[:, 0] = np.uint16(0)
+        value_previous[:, 1:] = chunk_values[:, :-1]
+        value_deltas = np.bitwise_xor(chunk_values, value_previous)
+        encoded += value_deltas.astype("<u2", copy=False).tobytes()
+    return bytes(encoded)
+
+
 def _msmr_position_quantization(data, blocks):
     position_scale = 1.0 / 4096.0
     position_offset = (0.0, 0.0, 0.0)
@@ -924,6 +965,7 @@ def decode_msmr_morphs(data, blocks, allowed_subset_ids=None):
                 if page_vertex_count == 0:
                     if run_count:
                         raise ValueError(f"MSMR morph target {target_index} has an invalid empty data page")
+                    pages.append((0, 0))
                     continue
                 if page_vertex_total + int(page_vertex_count) > changed_count:
                     raise ValueError(f"MSMR morph target {target_index} has an invalid page vertex count")
@@ -937,6 +979,8 @@ def decode_msmr_morphs(data, blocks, allowed_subset_ids=None):
             run_ptr = target_index_start + int(subset_index_offsets[morph_subset_index])
             deltas = {}
             for page_index, (page_vertex_count, run_count) in enumerate(pages):
+                if page_vertex_count == 0:
+                    continue
                 quantized, byte_count = _decode_msmr_morph_values(
                     data,
                     delta_ptr,
@@ -997,6 +1041,9 @@ def decode_msmr_morphs(data, blocks, allowed_subset_ids=None):
             "index": target_index,
             "packing_kind": int(packing_kind),
             "packing_null": int(packing_null),
+            "component_bits": int(component_bits),
+            "position_scale": float(position_scale),
+            "position_bias": float(position_bias),
             "normal_scale": float(normal_scale),
             "normal_bias": float(normal_bias),
             "subsets": decoded_subsets,
@@ -1014,6 +1061,185 @@ def decode_msmr_morphs(data, blocks, allowed_subset_ids=None):
         "version": int(version),
         "format": "MSMR_LEGACY",
     }
+
+
+def _encode_msmr_morph_values(values, component_bits):
+    values = np.asarray(values, dtype=np.uint32).reshape(-1)
+    shifts = np.arange(int(component_bits) - 1, -1, -1, dtype=np.uint32)
+    bits = ((values[:, None] >> shifts[None, :]) & np.uint32(1)).astype(np.uint8)
+    return np.packbits(bits.reshape(-1), bitorder="big").tobytes()
+
+
+def _msmr_morph_runs(vertex_indices, page_start):
+    runs = []
+    current = int(page_start)
+    indices = sorted(int(value) for value in vertex_indices)
+    cursor = 0
+    while cursor < len(indices):
+        run_start = indices[cursor]
+        run_end = run_start + 1
+        cursor += 1
+        while cursor < len(indices) and indices[cursor] == run_end and run_end - run_start < 0xFFFF:
+            run_end += 1
+            cursor += 1
+        skip_count = run_start - current
+        read_count = run_end - run_start
+        if not 0 <= skip_count <= 0xFFFF:
+            raise ValueError("MSMR morph index skip is outside the 16-bit range")
+        runs.append((skip_count, 0 if read_count == 0x20 else read_count))
+        current = run_end
+    return runs
+
+
+def encode_msmr_morphs(targets, mirrors=(), version=2):
+    """Encode legacy MSMR position morph targets into their three DAT1 blocks.
+
+    Each target must provide an absolute DAT1 ``name_offset`` and a list of
+    subset dictionaries containing ``subset_index`` and sparse XYZ ``deltas``.
+    """
+    targets = list(targets or [])
+    mirrors = [tuple(int(value) & 0xFFFFFFFF for value in pair) for pair in (mirrors or ())]
+    info = bytearray(b"\x00" * 24)
+    table_relative = len(info)
+    info += b"\x00" * (len(targets) * 8)
+    mirror_relative = len(info)
+    for left_hash, right_hash in mirrors:
+        info += struct.pack("<II", left_hash, right_hash)
+    while len(info) & 0xF:
+        info.append(0)
+
+    delta_block = bytearray()
+    index_block = bytearray()
+    table_entries = []
+    for target_index, target in enumerate(targets):
+        target_relative = len(info)
+        name_hash = int(target.get("hash", 0)) & 0xFFFFFFFF
+        name_offset = int(target.get("name_offset", 0)) & 0xFFFFFFFF
+        subsets = [
+            subset for subset in target.get("subsets", [])
+            if subset.get("deltas")
+        ]
+        subsets.sort(key=lambda item: int(item.get("subset_index", -1)))
+        if len(subsets) > 0xFFFF:
+            raise ValueError(f"MSMR morph target {target_index} has too many subset records")
+
+        all_components = [
+            float(component)
+            for subset in subsets
+            for delta in subset.get("deltas", {}).values()
+            for component in delta
+        ]
+        component_bits = max(1, min(24, int(target.get("component_bits", 16) or 16)))
+        quantized_max = (1 << component_bits) - 1
+        if all_components:
+            position_bias = min(all_components)
+            maximum = max(all_components)
+            position_scale = (maximum - position_bias) / float(quantized_max) if maximum > position_bias else 0.0
+        else:
+            position_bias = 0.0
+            position_scale = 0.0
+
+        target_delta_start = len(delta_block)
+        target_index_start = len(index_block)
+        subset_ids = []
+        subset_delta_offsets = []
+        subset_index_offsets = []
+        changed_counts = []
+        table_indexes = []
+        page_tables = []
+        for subset in subsets:
+            subset_index = int(subset.get("subset_index", -1))
+            if not 0 <= subset_index <= 0xFF:
+                raise ValueError("MSMR legacy morph subsets use 8-bit subset IDs")
+            sparse = {
+                int(vertex_index): tuple(float(value) for value in delta)
+                for vertex_index, delta in subset.get("deltas", {}).items()
+            }
+            if any(vertex_index < 0 for vertex_index in sparse):
+                raise ValueError("MSMR morph target references a negative vertex index")
+            subset_ids.append(subset_index)
+            subset_delta_offsets.append(len(delta_block) - target_delta_start)
+            subset_index_offsets.append(len(index_block) - target_index_start)
+            changed_counts.append(len(sparse))
+            table_indexes.append(len(page_tables))
+
+            last_page = max(sparse, default=-1) // MSMR_MORPH_PAGE_VERTEX_COUNT
+            for page_index in range(last_page + 1):
+                page_start = page_index * MSMR_MORPH_PAGE_VERTEX_COUNT
+                page_stop = page_start + MSMR_MORPH_PAGE_VERTEX_COUNT
+                page_indices = [index for index in sorted(sparse) if page_start <= index < page_stop]
+                if not page_indices:
+                    page_tables.append((0, 0))
+                    continue
+                runs = _msmr_morph_runs(page_indices, page_start)
+                page_tables.append((len(page_indices), len(runs)))
+                page_values = np.asarray([sparse[index] for index in page_indices], dtype=np.float64)
+                if position_scale > 0.0:
+                    quantized = np.rint((page_values - position_bias) / position_scale)
+                    quantized = np.clip(quantized, 0, quantized_max).astype(np.uint32)
+                else:
+                    quantized = np.zeros(page_values.shape, dtype=np.uint32)
+                delta_block += _encode_msmr_morph_values(quantized, component_bits)
+                while (len(delta_block) - target_delta_start) & 3:
+                    delta_block.append(0)
+                for skip_count, read_count in runs:
+                    index_block += struct.pack("<HH", skip_count, read_count)
+
+        tail = bytearray(subset_ids)
+        while len(tail) & 3:
+            tail.append(0)
+        if subset_delta_offsets:
+            tail += struct.pack(f"<{len(subset_delta_offsets)}I", *subset_delta_offsets)
+            tail += struct.pack(f"<{len(subset_index_offsets)}I", *subset_index_offsets)
+            tail += struct.pack(f"<{len(changed_counts)}H", *changed_counts)
+            while len(tail) & 3:
+                tail.append(0)
+            tail += struct.pack(f"<{len(table_indexes)}H", *table_indexes)
+            while len(tail) & 3:
+                tail.append(0)
+        for page_vertex_count, run_count in page_tables:
+            tail += struct.pack("<HI", page_vertex_count, run_count)
+        subset_info_length = len(tail)
+
+        header = struct.pack(
+            "<4I4B4fHHII",
+            name_hash,
+            name_offset,
+            target_delta_start,
+            target_index_start,
+            int(target.get("packing_kind", 1)) & 0xFF,
+            component_bits * 3,
+            component_bits,
+            int(target.get("packing_null", 0)) & 0xFF,
+            float(position_scale),
+            float(position_bias),
+            float(target.get("normal_scale", 0.0)),
+            float(target.get("normal_bias", 0.0)),
+            len(subsets),
+            subset_info_length,
+            len(delta_block) - target_delta_start,
+            len(index_block) - target_index_start,
+        )
+        info += header + tail
+        while len(info) & 0xF:
+            info.append(0)
+        table_entries.append((name_hash, target_relative))
+
+    for target_index, (name_hash, target_relative) in enumerate(table_entries):
+        struct.pack_into("<II", info, table_relative + target_index * 8, name_hash, target_relative)
+    struct.pack_into(
+        "<IIHHIII",
+        info,
+        0,
+        0,
+        len(delta_block) + len(index_block),
+        len(targets),
+        len(mirrors),
+        table_relative,
+        mirror_relative,
+        int(version),
+    )
+    return bytes(info), bytes(delta_block), bytes(index_block)
 
 
 def decode_msmr_skin_weights(data, blocks, subset, joint_count):

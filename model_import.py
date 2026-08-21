@@ -845,6 +845,13 @@ def _import_msmr_subsets(
             name="engine_source_position", type='FLOAT_VECTOR', domain='POINT'
         )
         source_position_attr.data.foreach_set("vector", vertices_flat)
+        source_vertex_index_attr = mesh.attributes.new(
+            name="engine_source_vertex_index", type='INT', domain='POINT'
+        )
+        source_vertex_index_attr.data.foreach_set(
+            "value",
+            np.arange(vertex_count, dtype=np.int32),
+        )
         source_uv0_u_attr = mesh.attributes.new(name="engine_source_uv0_u", type='FLOAT', domain='POINT')
         source_uv0_v_attr = mesh.attributes.new(name="engine_source_uv0_v", type='FLOAT', domain='POINT')
         source_uv0_u_attr.data.foreach_set("value", uv0[:, 0])

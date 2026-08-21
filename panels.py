@@ -536,9 +536,12 @@ def _draw_model_export_panel(layout, context, arm):
     box = layout.box()
     box.label(text="Export")
     col = box.column(align=True)
-    col.prop(context.scene, "engine_export_add_stg_header", text="Add STG Header")
+    if str(arm.get("engine_model_format", "") or "") == "MSMR":
+        col.label(text="Native MSMR wrapper added automatically", icon='CHECKMARK')
+    else:
+        col.prop(context.scene, "engine_export_add_stg_header", text="Add STG Header")
     if bool(arm.get("engine_model_source_has_morphs", False)) and not bool(arm.get("engine_model_shape_keys_imported", False)):
-        col.prop(arm, "engine_model_discard_unimported_morphs", text="Discard Unimported Morph2")
+        col.prop(arm, "engine_model_discard_unimported_morphs", text="Discard Unimported Morphs")
     col.operator(MODEL_OT_export_with_model_settings.bl_idname, text="Export Model")
 
 

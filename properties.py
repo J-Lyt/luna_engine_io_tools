@@ -282,7 +282,11 @@ def _luna_settings_sync_timer():
 def update_lod_visibility(self, context):
     armature = self
     resolve_subset_index_collisions(armature)
-    sanitize_model_look_metadata(armature, mark_modified=True)
+    if (
+        bool(armature.get("engine_model_import_all_lods", False))
+        or bool(armature.get("engine_model_looks_modified", False))
+    ):
+        sanitize_model_look_metadata(armature, mark_modified=True)
     active_lod = armature.active_lod
     if bool(armature.get("engine_model_source_path")) and not bool(armature.get("engine_model_import_all_lods", False)):
         active_lod = 0
@@ -627,8 +631,8 @@ def register_properties():
         default="",
     )
     bpy.types.Object.engine_model_discard_unimported_morphs = BoolProperty(
-        name="Discard Unimported Morph2",
-        description="Deliberately remove source Morph2 data when it was not imported as shape keys",
+        name="Discard Unimported Morphs",
+        description="Deliberately remove source morph data when it was not imported as shape keys",
         default=False,
     )
     bpy.types.Object.engine_ziva_active_channel = EnumProperty(

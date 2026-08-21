@@ -81,11 +81,17 @@ class ANIM_OT_reload_event_schemas(Operator):
 class MODEL_OT_export_with_model_settings(Operator):
     bl_idname = "model.export_with_luna_settings"
     bl_label = "Export Luna Engine Model"
-    bl_description = "Export the selected model using the Model panel DAT1/STG setting"
+    bl_description = "Export the selected model using the appropriate game-model wrapper"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        mode = "STG" if bool(getattr(context.scene, "engine_export_add_stg_header", True)) else "RAW"
+        arm = _model_armature_from_context(context)
+        if arm and str(arm.get("engine_model_format", "") or "") == "MSMR":
+            # MSMR uses its own native 36-byte model wrapper, not Spider-Man 2's
+            # optional STG container. Preserve the imported source wrapper.
+            mode = "AUTO"
+        else:
+            mode = "STG" if bool(getattr(context.scene, "engine_export_add_stg_header", True)) else "RAW"
         return bpy.ops.export_scene.engine_model('INVOKE_DEFAULT', stg_mode=mode)
 
 

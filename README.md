@@ -6,7 +6,7 @@
 
 * **Model import**: Import one or more compiled `.model` files from Marvel's Spider-Man 2 or Marvel's Spider-Man Remastered into Blender.
 * **Model export**: Export selected Blender model data back into the Luna Engine model format.
-* **Morph editing**: Import Spider-Man 2 Morph2 or Remastered legacy morph data as shape keys, share controls across subsets, and rebuild Morph2 on Spider-Man 2 export.
+* **Morph editing**: Import Spider-Man 2 Morph2 or Remastered legacy morph data as shape keys, share controls across subsets, and rebuild the matching morph format on export.
 * **Ziva replacement tools**: Evaluate compiled Ziva2 rigs, transfer named channels to replacement topology, and capture joint-driven poses as editable Morph2 targets.
 * **Animation import**: Import `.animclip` files and apply them to an existing armature or camera.
 * **Animation export**: Export the selected armature or camera animation as an `.animclip` file.

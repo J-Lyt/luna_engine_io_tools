@@ -9,6 +9,29 @@ from .model_morph import (
     encode_model_morph2,
     encode_model_smooth2,
 )
+from .model_msmr import (
+    MSMR_MODEL_ANIM_MORPH_DATA_HASH,
+    MSMR_MODEL_ANIM_MORPH_INDICES_HASH,
+    MSMR_MODEL_ANIM_MORPH_INFO_HASH,
+    MSMR_MODEL_COL_VERT_HASH,
+    MSMR_MODEL_INDEX_HASH,
+    MSMR_MODEL_MAGIC,
+    MSMR_MODEL_SKIN_BATCH_HASH,
+    MSMR_MODEL_SKIN_DATA_HASH,
+    MSMR_MODEL_SKIN_JOINT_REMAP_HASH,
+    MSMR_MODEL_STD_VERT_HASH,
+    MSMR_MODEL_UV1_VERT_HASH,
+    MSMR_SUBSET_RECORD_SIZE,
+    decode_msmr_geometry,
+    decode_msmr_morphs,
+    decode_msmr_skin_weights,
+    encode_msmr_index_stream,
+    encode_msmr_morphs,
+    encode_msmr_vertex_stream,
+    is_msmr_model,
+    parse_msmr_look_groups_metadata,
+    parse_msmr_subset,
+)
 from .model_import import (
     MODEL_MATERIAL_INFO_SIZE,
     MODEL_MATERIAL_SIZE,
@@ -42,6 +65,7 @@ from .model_import import (
 
 DAT1_BLOCK_ALIGN = 16
 DAT1_CACHELINE_ALIGN = 64
+MSMR_SKIN_BATCH_MAX_VERTEX_COUNT = 2560
 STG_MAGIC = 0x00475453
 STG_VERSION = 0x1
 STG_HEADER_ALIGN = 16
@@ -1043,7 +1067,10 @@ def _export_mesh_vertices(
                 "name": str(target["name"]),
                 "hash": int(target["hash"]) & U32_MASK,
                 "source_index": int(target.get("source_index", target.get("index", -1))),
-                "deltas": {int(index): tuple(delta) for index, delta in target.get("deltas", {}).items()},
+                "source_deltas": {
+                    int(index): tuple(delta)
+                    for index, delta in target.get("deltas", {}).items()
+                },
             }
             for target in fallback_morph_targets
         ]
@@ -1064,6 +1091,28 @@ def _export_mesh_vertices(
             source_position_w = attr.data
     except Exception:
         source_position_w = None
+
+    msmr_tangent = mesh.attributes.get("MSMR_Tangent")
+    msmr_tangent_sign = mesh.attributes.get("MSMR_BitangentSign")
+    msmr_tangent_valid = mesh.attributes.get("MSMR_TangentValid")
+    if not (
+        msmr_tangent is not None
+        and msmr_tangent.domain == 'POINT'
+        and len(msmr_tangent.data) == len(mesh.vertices)
+    ):
+        msmr_tangent = None
+    if not (
+        msmr_tangent_sign is not None
+        and msmr_tangent_sign.domain == 'POINT'
+        and len(msmr_tangent_sign.data) == len(mesh.vertices)
+    ):
+        msmr_tangent_sign = None
+    if not (
+        msmr_tangent_valid is not None
+        and msmr_tangent_valid.domain == 'POINT'
+        and len(msmr_tangent_valid.data) == len(mesh.vertices)
+    ):
+        msmr_tangent_valid = None
 
     source_basis = _source_model_basis(mesh, uv0_layer, basis_coords)
     source_basis_packed_exact = bool(source_basis and _linear_matrix_is_identity(linear_matrix))
@@ -1135,6 +1184,36 @@ def _export_mesh_vertices(
             else:
                 tangent = triangle_tangent
                 tangent_flip = triangle_tangent_flip
+            tangent_attribute_valid = bool(
+                msmr_tangent is not None
+                and (
+                    msmr_tangent_valid is None
+                    or msmr_tangent_valid.data[source_vertex_index].value
+                )
+            )
+            if tangent_attribute_valid:
+                tangent_vector = msmr_tangent.data[source_vertex_index].vector
+                tangent_engine = _vec_normalize(_blender_to_engine_vec(
+                    linear_matrix @ mathutils.Vector(tangent_vector)
+                ))
+                tangent_sign = (
+                    float(msmr_tangent_sign.data[source_vertex_index].value)
+                    if msmr_tangent_sign is not None
+                    else -float(tangent_flip)
+                )
+                attribute_flip = -tangent_sign * tangent_flip_transform
+                tangent_was_edited = (
+                    # Decoding and re-exposing the packed source tangent as a
+                    # float attribute introduces a few ulps around zero. Keep
+                    # the exact packed word unless the authored direction moved
+                    # by more than that round-trip noise.
+                    _vec_dot(tangent_engine, tangent) < 0.9999
+                    or (attribute_flip >= 0.0) != (float(tangent_flip) >= 0.0)
+                )
+                if source_basis is None or tangent_was_edited:
+                    tangent = tangent_engine
+                    tangent_flip = attribute_flip
+                    packed_source_basis = None
             extrusion_encoded = 16
             if source_position_w is not None:
                 extrusion_encoded = (abs(int(source_position_w[source_vertex_index].value)) >> 10) & 0x1F
@@ -1945,12 +2024,1789 @@ def _build_geometry_and_subset_blocks(
     )
 
 
+def _msmr_subset_bounds(vertices):
+    coords = [tuple(float(value) for value in vertex["co"]) for vertex in vertices]
+    mins = tuple(min(value[axis] for value in coords) for axis in range(3))
+    maxs = tuple(max(value[axis] for value in coords) for axis in range(3))
+    center = tuple((mins[axis] + maxs[axis]) * 0.5 for axis in range(3))
+    extents = tuple((maxs[axis] - mins[axis]) * 0.5 for axis in range(3))
+    radius = max((_vec_len(_vec_sub(value, center)) for value in coords), default=0.0)
+    return center, extents, radius
+
+
+def _msmr_color_word(obj, source_vertex_index, fallback=0):
+    mesh = obj.data
+    source_word = int(fallback) & U32_MASK
+    source_attribute = mesh.attributes.get("engine_source_vertex_color")
+    if (
+        source_attribute is not None
+        and source_attribute.domain == 'POINT'
+        and source_vertex_index < len(source_attribute.data)
+    ):
+        source_word = int(source_attribute.data[source_vertex_index].value) & U32_MASK
+
+    color_word = None
+    color_attribute = mesh.color_attributes.get("MSMR_Color")
+    if (
+        color_attribute is not None
+        and color_attribute.domain == 'POINT'
+        and source_vertex_index < len(color_attribute.data)
+    ):
+        item = color_attribute.data[source_vertex_index]
+        try:
+            color = item.color_srgb
+        except Exception:
+            color = item.color
+        channels = [_clamp_u8(float(value) * 255.0) for value in color]
+        color_word = sum(int(value) << (channel * 8) for channel, value in enumerate(channels))
+
+    mask_word = None
+    mask_attributes = [mesh.attributes.get(f"MSMR_Mask_{name}") for name in "RGBA"]
+    if all(
+        attribute is not None
+        and attribute.domain == 'POINT'
+        and source_vertex_index < len(attribute.data)
+        for attribute in mask_attributes
+    ):
+        channels = [
+            _clamp_u8(float(attribute.data[source_vertex_index].value) * 255.0)
+            for attribute in mask_attributes
+        ]
+        mask_word = sum(int(value) << (channel * 8) for channel, value in enumerate(channels))
+
+    color_changed = color_word is not None and color_word != source_word
+    mask_changed = mask_word is not None and mask_word != source_word
+    if color_changed:
+        return int(color_word) & U32_MASK
+    if mask_changed:
+        return int(mask_word) & U32_MASK
+    return source_word
+
+
+def _msmr_vertex_stream_key(vertices, colors):
+    digest = hashlib.sha1()
+    for vertex, color_word in zip(vertices, colors):
+        uv0 = vertex.get("uv0") or (0.0, 0.0)
+        uv1 = vertex.get("uv1") or (0.0, 0.0)
+        digest.update(struct.pack(
+            "<3dIi4dI",
+            float(vertex["co"][0]),
+            float(vertex["co"][1]),
+            float(vertex["co"][2]),
+            int(vertex["normal_tangent"]) & U32_MASK,
+            int(vertex["position_w"]),
+            float(uv0[0]),
+            float(uv0[1]),
+            float(uv1[0]),
+            float(uv1[1]),
+            int(color_word) & U32_MASK,
+        ))
+    return len(vertices), digest.digest()
+
+
+def _msmr_normalized_group_weights(vertices):
+    result = []
+    for vertex in vertices:
+        normalized = _normalize_skin_weights(vertex.get("weights", []))
+        normalized = [(int(joint), int(weight)) for joint, weight in normalized if int(weight) > 0]
+        result.append(normalized or [(0, 256)])
+    return result
+
+
+def _msmr_source_subset_skin_matches(
+    template,
+    vertices,
+    force_skin,
+    subset_index,
+    source_joint_count,
+):
+    subset_hash = BLOCK_HASHES["ModelSubset"]
+    if (
+        subset_hash not in template.blocks
+        or MSMR_MODEL_SKIN_DATA_HASH not in template.blocks
+        or MSMR_MODEL_SKIN_BATCH_HASH not in template.blocks
+    ):
+        return False
+    subset_offset, subset_size = template.blocks[subset_hash]
+    if not 0 <= int(subset_index) < int(subset_size) // MSMR_SUBSET_RECORD_SIZE:
+        return False
+    source_subset = parse_msmr_subset(template.data, subset_offset, subset_index)
+    if int(source_subset["vertex_count"]) != len(vertices):
+        return False
+    if not force_skin:
+        return int(source_subset["skin_batch_count"]) == 0
+    source_grouped = decode_msmr_skin_weights(
+        template.data,
+        template.blocks,
+        source_subset,
+        source_joint_count,
+    )
+    source_by_vertex = [[] for _index in vertices]
+    for joint, weights in source_grouped.items():
+        for weight, vertex_indices in weights.items():
+            for vertex_index in vertex_indices:
+                if not 0 <= int(vertex_index) < len(source_by_vertex):
+                    return False
+                source_by_vertex[int(vertex_index)].append((int(joint), int(weight)))
+    source_by_vertex = [tuple(sorted(values)) for values in source_by_vertex]
+    exported_by_vertex = [
+        tuple(sorted(values))
+        for values in _msmr_normalized_group_weights(vertices)
+    ]
+    return source_by_vertex == exported_by_vertex
+
+
+def _msmr_source_skin_matches(
+    template,
+    subset_vertices,
+    subset_force_skin,
+    source_joint_count,
+):
+    subset_hash = BLOCK_HASHES["ModelSubset"]
+    if subset_hash not in template.blocks:
+        return False
+    _subset_offset, subset_size = template.blocks[subset_hash]
+    if len(subset_vertices) != int(subset_size) // MSMR_SUBSET_RECORD_SIZE:
+        return False
+    return all(
+        _msmr_source_subset_skin_matches(
+            template,
+            vertices,
+            subset_force_skin[subset_index],
+            subset_index,
+            source_joint_count,
+        )
+        for subset_index, vertices in enumerate(subset_vertices)
+    )
+
+
+def _build_msmr_skin_blocks(
+    subset_vertices,
+    subset_indices,
+    subset_force_skin,
+    use_joint_remap,
+    template=None,
+    source_joint_count=0,
+    source_subset_indices=None,
+):
+    skin_data = bytearray()
+    skin_batches = bytearray()
+    joint_remaps = bytearray()
+    subset_batch_ranges = []
+    skin_cache = {}
+    source_range_cache = {}
+    source_subset_indices = list(source_subset_indices or range(len(subset_vertices)))
+
+    source_subset_offset = 0
+    source_batch_offset = source_batch_size = 0
+    source_skin_offset = source_skin_size = 0
+    source_remap_offset = 0
+    source_total_batches = 0
+    source_total_subsets = 0
+    if template is not None and BLOCK_HASHES["ModelSubset"] in template.blocks:
+        source_subset_offset, source_subset_size = template.blocks[BLOCK_HASHES["ModelSubset"]]
+        source_total_subsets = int(source_subset_size) // MSMR_SUBSET_RECORD_SIZE
+        source_batch_offset, source_batch_size = template.blocks.get(MSMR_MODEL_SKIN_BATCH_HASH, (0, 0))
+        source_skin_offset, source_skin_size = template.blocks.get(MSMR_MODEL_SKIN_DATA_HASH, (0, 0))
+        source_remap_offset, _source_remap_size = template.blocks.get(MSMR_MODEL_SKIN_JOINT_REMAP_HASH, (0, 0))
+        source_total_batches = int(source_batch_size) // 16
+
+    for subset_index, vertices in enumerate(subset_vertices):
+        first_batch = len(skin_batches) // 16
+        if not subset_force_skin[subset_index]:
+            subset_batch_ranges.append((first_batch, 0))
+            continue
+        source_subset_index = (
+            int(source_subset_indices[subset_index])
+            if subset_index < len(source_subset_indices)
+            else subset_index
+        )
+        source_subset = None
+        if (
+            template is not None
+            and source_batch_offset
+            and 0 <= source_subset_index < source_total_subsets
+        ):
+            source_subset = parse_msmr_subset(
+                template.data,
+                source_subset_offset,
+                source_subset_index,
+            )
+        if (
+            source_subset is not None
+            and _msmr_source_subset_skin_matches(
+                template,
+                vertices,
+                True,
+                source_subset_index,
+                source_joint_count,
+            )
+        ):
+            source_range = (
+                int(source_subset["first_skin_batch"]),
+                int(source_subset["skin_batch_count"]),
+            )
+            cached_source_range = source_range_cache.get(source_range)
+            if cached_source_range is not None:
+                subset_batch_ranges.append(cached_source_range)
+                continue
+            for source_batch_index in range(source_range[0], sum(source_range)):
+                source_record_offset = source_batch_offset + source_batch_index * 16
+                record = struct.unpack_from("<IIHHHH", template.data, source_record_offset)
+                old_data_offset, old_remap_offset, remap_count, unknown, count, first_vertex = record
+                next_data_offset = (
+                    struct.unpack_from(
+                        "<I",
+                        template.data,
+                        source_batch_offset + (source_batch_index + 1) * 16,
+                    )[0]
+                    if source_batch_index + 1 < source_total_batches
+                    else source_skin_size
+                )
+                _align_buffer(skin_data, DAT1_BLOCK_ALIGN)
+                data_offset = len(skin_data)
+                skin_data.extend(template.data[
+                    source_skin_offset + int(old_data_offset):
+                    source_skin_offset + int(next_data_offset)
+                ])
+                remap_offset = 0
+                if remap_count:
+                    _align_buffer(joint_remaps, DAT1_BLOCK_ALIGN)
+                    remap_offset = len(joint_remaps)
+                    joint_remaps.extend(template.data[
+                        source_remap_offset + int(old_remap_offset):
+                        source_remap_offset + int(old_remap_offset) + int(remap_count) * 2
+                    ])
+                skin_batches.extend(struct.pack(
+                    "<IIHHHH",
+                    data_offset,
+                    remap_offset,
+                    remap_count,
+                    unknown,
+                    count,
+                    first_vertex,
+                ))
+            batch_range = (first_batch, source_range[1])
+            source_range_cache[source_range] = batch_range
+            subset_batch_ranges.append(batch_range)
+            continue
+        repaired_count, fallback_count = _repair_missing_skin_weights(
+            vertices,
+            subset_indices[subset_index],
+        )
+        if repaired_count:
+            log_warning(
+                "MSMR subset %d repaired %d missing skin weights (%d fallback)",
+                subset_index,
+                repaired_count,
+                fallback_count,
+            )
+        normalized = _msmr_normalized_group_weights(vertices)
+        digest = hashlib.sha1()
+        for weights in normalized:
+            digest.update(struct.pack("<B", len(weights)))
+            for joint, weight in weights:
+                digest.update(struct.pack("<HH", int(joint), int(weight)))
+        skin_key = (len(normalized), digest.digest())
+        cached_range = skin_cache.get(skin_key)
+        if cached_range is not None:
+            subset_batch_ranges.append(cached_range)
+            continue
+        groups = [normalized[start:start + 16] for start in range(0, len(normalized), 16)]
+        pending = []
+        pending_joints = set()
+
+        def flush_pending():
+            nonlocal pending, pending_joints
+            if not pending:
+                return
+            palette = sorted(pending_joints) or [0]
+            if use_joint_remap:
+                if len(palette) > 256:
+                    raise ValueError(f"MSMR subset {subset_index} needs more than 256 joints in one skin batch")
+                palette_index = {joint: index for index, joint in enumerate(palette)}
+            else:
+                if any(not 0 <= int(joint) <= 0xFF for joint in palette):
+                    raise ValueError(
+                        f"MSMR subset {subset_index} uses a joint above 255, but its source model has no "
+                        "joint-remap stream"
+                    )
+                palette_index = {joint: int(joint) for joint in palette}
+            _align_buffer(skin_data, DAT1_BLOCK_ALIGN)
+            data_offset = len(skin_data)
+            first_vertex = pending[0][0]
+            vertex_count = sum(len(group) for _start, group in pending)
+            for _group_start, group in pending:
+                influence_count = max(len(weights) for weights in group)
+                if influence_count > 1:
+                    influence_count = max(2, influence_count)
+                skin_data.append(influence_count - 1)
+                for weights in group:
+                    entries = list(weights)
+                    if influence_count == 1:
+                        skin_data.append(palette_index[int(entries[0][0])] & 0xFF)
+                        continue
+
+                    # MSMR stores explicit byte weights for every influence,
+                    # while Blender's normalized values total 256. Preserve
+                    # that total by making the first byte the residual of all
+                    # following bytes. A fully weighted vertex cannot encode
+                    # 256 in one byte, so the game convention is 255 + 1 on
+                    # the same joint.
+                    joints = [int(entries[0][0])] * influence_count
+                    encoded_weights = [0] * influence_count
+                    encoded_weights[0] = 256
+                    for influence_index, (joint, weight) in enumerate(
+                        entries[1:influence_count],
+                        start=1,
+                    ):
+                        joints[influence_index] = int(joint)
+                        encoded_weights[influence_index] = int(weight)
+                        encoded_weights[0] -= int(weight)
+                    if encoded_weights[0] > 255:
+                        encoded_weights[0] = 255
+                        encoded_weights[1] = 1
+                        joints[1] = joints[0]
+                    elif encoded_weights[0] < 0:
+                        encoded_weights[0] = 0
+                    for influence_index in range(1, influence_count):
+                        if encoded_weights[influence_index] == 0:
+                            joints[influence_index] = joints[influence_index - 1]
+                    for joint, weight in zip(joints, encoded_weights):
+                        skin_data.append(palette_index[int(joint)] & 0xFF)
+                        skin_data.append(int(weight) & 0xFF)
+            if use_joint_remap:
+                _align_buffer(joint_remaps, DAT1_BLOCK_ALIGN)
+            remap_offset = len(joint_remaps) if use_joint_remap else 0
+            if use_joint_remap:
+                joint_remaps.extend(struct.pack(f"<{len(palette)}H", *palette))
+            skin_batches.extend(struct.pack(
+                "<IIHHHH",
+                data_offset,
+                remap_offset,
+                len(palette) if use_joint_remap else 0,
+                0,
+                vertex_count,
+                first_vertex,
+            ))
+            pending = []
+            pending_joints = set()
+
+        for group_index, group in enumerate(groups):
+            group_joints = {joint for weights in group for joint, weight in weights if weight > 0}
+            pending_vertex_count = sum(len(pending_group) for _start, pending_group in pending)
+            if pending and (
+                pending_vertex_count + len(group) > MSMR_SKIN_BATCH_MAX_VERTEX_COUNT
+                or (use_joint_remap and len(pending_joints | group_joints) > 256)
+            ):
+                flush_pending()
+            pending.append((group_index * 16, group))
+            pending_joints.update(group_joints)
+        flush_pending()
+        batch_count = len(skin_batches) // 16 - first_batch
+        if batch_count > 0xFF or first_batch > 0xFFFF:
+            raise ValueError(f"MSMR subset {subset_index} has too many skin batches")
+        batch_range = (first_batch, batch_count)
+        skin_cache[skin_key] = batch_range
+        subset_batch_ranges.append(batch_range)
+
+    return bytes(skin_data), bytes(skin_batches), bytes(joint_remaps), subset_batch_ranges
+
+
+def _fit_msmr_position_quantization(vertices, source_offset, source_scale):
+    coords = [tuple(float(value) for value in vertex["co"]) for vertex in vertices]
+    source_offset = tuple(float(value) for value in source_offset)
+    source_scale = max(float(source_scale), 1.0e-12)
+    if all(
+        -32768 <= _round_engine((co[axis] - source_offset[axis]) / source_scale) <= 32767
+        for co in coords
+        for axis in range(3)
+    ):
+        return source_offset, source_scale
+    mins = tuple(min(co[axis] for co in coords) for axis in range(3))
+    maxs = tuple(max(co[axis] for co in coords) for axis in range(3))
+    offset = tuple((mins[axis] + maxs[axis]) * 0.5 for axis in range(3))
+    scale = max(
+        source_scale,
+        max((maxs[axis] - mins[axis]) / 65534.0 for axis in range(3)),
+    )
+    return offset, math.nextafter(scale, math.inf)
+
+
+def _matrix_is_identity(matrix, threshold=1.0e-7):
+    for row in range(4):
+        for column in range(4):
+            expected = 1.0 if row == column else 0.0
+            if abs(float(matrix[row][column]) - expected) > threshold:
+                return False
+    return True
+
+
+def _msmr_source_slot_topology(obj, arm, source_geometry, source_subset):
+    """Map a compatible mesh back onto its original MSMR vertex slots."""
+    mesh = obj.data
+    source_vertex_count = int(source_subset["vertex_count"])
+    if len(mesh.vertices) > source_vertex_count:
+        return None
+    if not _matrix_is_identity(_safe_matrix_relative_to_armature(arm, obj)):
+        return None
+
+    attributes = {}
+    for name in (
+        "engine_source_position",
+        "engine_source_normal_tangent",
+        "engine_position_w",
+        "engine_source_uv0_u",
+        "engine_source_uv0_v",
+    ):
+        attribute = mesh.attributes.get(name)
+        if attribute is None or attribute.domain != 'POINT' or len(attribute.data) != len(mesh.vertices):
+            return None
+        attributes[name] = attribute.data
+
+    uv0_layer = _uv_layer_by_name_or_index(mesh, "UV0", 0)
+    if uv0_layer is None:
+        return None
+    source_start = int(source_subset["vertex_start"])
+    source_positions = source_geometry["positions"]
+    source_normals = source_geometry["normal_words"]
+    source_position_ws = source_geometry["position_ws"]
+    source_uv0 = source_geometry["uv0"]
+
+    def source_key(local_index):
+        global_index = source_start + int(local_index)
+        position = source_positions[global_index]
+        return struct.pack(
+            "<3fIi2f",
+            float(position[0]),
+            -float(position[2]),
+            float(position[1]),
+            int(source_normals[global_index]) & U32_MASK,
+            int(source_position_ws[global_index]),
+            float(source_uv0[global_index][0]),
+            float(source_uv0[global_index][1]),
+        )
+
+    source_keys = [source_key(local_index) for local_index in range(source_vertex_count)]
+    current_keys = []
+    for vertex_index in range(len(mesh.vertices)):
+        source_position = attributes["engine_source_position"][vertex_index].vector
+        current_keys.append(struct.pack(
+            "<3fIi2f",
+            float(source_position[0]),
+            float(source_position[1]),
+            float(source_position[2]),
+            int(attributes["engine_source_normal_tangent"][vertex_index].value) & U32_MASK,
+            int(attributes["engine_position_w"][vertex_index].value),
+            float(attributes["engine_source_uv0_u"][vertex_index].value),
+            float(attributes["engine_source_uv0_v"][vertex_index].value),
+        ))
+
+    slot_map = None
+    source_index_attribute = mesh.attributes.get("engine_source_vertex_index")
+    if (
+        source_index_attribute is not None
+        and source_index_attribute.domain == 'POINT'
+        and len(source_index_attribute.data) == len(mesh.vertices)
+    ):
+        candidate_map = [
+            int(source_index_attribute.data[vertex_index].value)
+            for vertex_index in range(len(mesh.vertices))
+        ]
+        if (
+            len(set(candidate_map)) == len(candidate_map)
+            and all(
+                0 <= source_slot < source_vertex_count
+                and current_keys[vertex_index] == source_keys[source_slot]
+                for vertex_index, source_slot in enumerate(candidate_map)
+            )
+        ):
+            slot_map = candidate_map
+
+    if slot_map is None and len(current_keys) == source_vertex_count and current_keys == source_keys:
+        # Existing scenes predate engine_source_vertex_index, but an intact
+        # source-sized vertex array still has an exact, unambiguous ID order.
+        slot_map = list(range(source_vertex_count))
+
+    if slot_map is None:
+        # Blender preserves the relative order of surviving vertices when
+        # vertices are deleted. Match that subsequence before falling back to
+        # unique packed metadata, which cannot identify duplicate source slots.
+        ordered_map = []
+        source_cursor = 0
+        for key in current_keys:
+            while source_cursor < source_vertex_count and source_keys[source_cursor] != key:
+                source_cursor += 1
+            if source_cursor >= source_vertex_count:
+                ordered_map = []
+                break
+            ordered_map.append(source_cursor)
+            source_cursor += 1
+        if len(ordered_map) == len(current_keys):
+            slot_map = ordered_map
+
+    if slot_map is None:
+        source_slots = {}
+        for local_index, key in enumerate(source_keys):
+            source_slots[key] = local_index if key not in source_slots else None
+        candidate_map = [source_slots.get(key) for key in current_keys]
+        if (
+            all(source_slot is not None for source_slot in candidate_map)
+            and len(set(candidate_map)) == len(candidate_map)
+        ):
+            slot_map = [int(source_slot) for source_slot in candidate_map]
+    if slot_map is None:
+        return None
+
+    mesh.calc_loop_triangles()
+    remapped_indices = []
+    for triangle in mesh.loop_triangles:
+        for loop_index in triangle.loops:
+            vertex_index = int(mesh.loops[int(loop_index)].vertex_index)
+            source_uv = (
+                float(attributes["engine_source_uv0_u"][vertex_index].value),
+                float(attributes["engine_source_uv0_v"][vertex_index].value),
+            )
+            if not _uv_nearly_equal(_loop_uv(uv0_layer, int(loop_index)), source_uv, threshold=1.0e-7):
+                return None
+            remapped_indices.append(slot_map[vertex_index])
+    if not remapped_indices or len(remapped_indices) > int(source_subset["index_count"]):
+        return None
+    return {
+        "slot_map": slot_map,
+        "indices": remapped_indices,
+    }
+
+
+def _msmr_source_slot_vertex_updates(
+    vertices,
+    color_words,
+    topology,
+    source_subset,
+    source_geometry,
+):
+    """Map exported vertices onto source slots and identify changed stream values."""
+    slot_map = topology["slot_map"]
+    source_start = int(source_subset["vertex_start"])
+    source_uv1 = source_geometry.get("uv1")
+    source_colors = source_geometry.get("color_words")
+    export_slot_map = []
+    slot_values = {}
+    updates = {}
+
+    def same_vertex(left, right):
+        return (
+            all(abs(float(a) - float(b)) <= 1.0e-7 for a, b in zip(left["co"], right["co"]))
+            and int(left["normal_tangent"]) == int(right["normal_tangent"])
+            and int(left["position_w"]) == int(right["position_w"])
+            and _uv_nearly_equal(
+                left.get("uv0", (0.0, 0.0)),
+                right.get("uv0", (0.0, 0.0)),
+                1.0e-7,
+            )
+            and _uv_nearly_equal(
+                left.get("uv1") or (0.0, 0.0),
+                right.get("uv1") or (0.0, 0.0),
+                1.0e-7,
+            )
+        )
+
+    for export_index, vertex in enumerate(vertices):
+        source_control_index = int(vertex.get("source_index", -1))
+        if not 0 <= source_control_index < len(slot_map):
+            return None
+        source_slot = int(slot_map[source_control_index])
+        if not 0 <= source_slot < int(source_subset["vertex_count"]):
+            return None
+        export_slot_map.append(source_slot)
+        previous = slot_values.get(source_slot)
+        if previous is not None and (
+            not same_vertex(previous[0], vertex)
+            or int(previous[1]) != int(color_words[export_index])
+        ):
+            # A source slot cannot represent two newly split loop vertices.
+            return None
+        slot_values[source_slot] = (vertex, int(color_words[export_index]) & U32_MASK)
+
+    source_index_start = int(source_subset["index_start"])
+    source_index_count = int(source_subset["index_count"])
+    source_indices = source_geometry["indices"][
+        source_index_start:source_index_start + source_index_count
+    ].astype(np.uint16).tolist()
+    if not (int(source_subset["flags"]) & 0x10):
+        source_indices = [
+            (int(index) - source_start) & 0xFFFF
+            for index in source_indices
+        ]
+    topology_unchanged = source_indices == [int(index) for index in topology["indices"]]
+    subset_position_changed = any(
+        any(
+            abs(float(vertex["co"][axis]) - float(source_geometry["positions"][source_start + source_slot][axis]))
+            > 1.0e-7
+            for axis in range(3)
+        )
+        for source_slot, (vertex, _color_word) in slot_values.items()
+    )
+
+    for source_slot, (vertex, color_word) in slot_values.items():
+        global_index = source_start + source_slot
+        co = vertex["co"]
+        position_changed = any(
+            abs(float(co[axis]) - float(source_geometry["positions"][global_index][axis])) > 1.0e-7
+            for axis in range(3)
+        )
+        tangent_frame_changed = (
+            (int(vertex["normal_tangent"]) & U32_MASK)
+            != (int(source_geometry["normal_words"][global_index]) & U32_MASK)
+            or int(vertex["position_w"]) != int(source_geometry["position_ws"][global_index])
+        )
+        changed = position_changed or (
+            tangent_frame_changed
+            and (topology_unchanged or subset_position_changed)
+        )
+        if source_uv1 is not None:
+            changed = changed or not _uv_nearly_equal(
+                vertex.get("uv1") or (0.0, 0.0),
+                source_uv1[global_index],
+                1.0e-7,
+            )
+        if source_colors is not None:
+            changed = changed or color_word != int(source_colors[global_index]) & U32_MASK
+        if changed:
+            updates[global_index] = (vertex, color_word)
+
+    return {
+        "export_slot_map": export_slot_map,
+        "vertex_updates": updates,
+    }
+
+
+def _msmr_hybrid_morph_targets(
+    template,
+    imported_targets,
+    imported_source_indices,
+    replaced_indices,
+    source_slot_topologies=None,
+):
+    source = decode_msmr_morphs(template.data, template.blocks)
+    if source is None:
+        return []
+    targets = []
+    by_source_index = {}
+    for source_index, source_target in enumerate(source.get("targets", [])):
+        target = {
+            "name": str(source_target.get("name", f"Morph_{source_index}")),
+            "hash": int(source_target.get("hash", 0)) & U32_MASK,
+            "source_index": source_index,
+            "subsets": [
+                {
+                    "subset_index": int(subset.get("subset_index", -1)),
+                    "deltas": dict(subset.get("deltas", {})),
+                }
+                for subset in source_target.get("subsets", [])
+                if subset.get("deltas")
+            ],
+        }
+        targets.append(target)
+        by_source_index[source_index] = target
+
+    source_slot_topologies = list(source_slot_topologies or [])
+    for generated_index in replaced_indices:
+        source_subset_index = int(imported_source_indices[generated_index])
+        for target in targets:
+            target["subsets"] = [
+                subset for subset in target["subsets"]
+                if int(subset.get("subset_index", -1)) != source_subset_index
+            ]
+        for edited in imported_targets[generated_index]:
+            source_target_index = int(edited.get("source_index", -1))
+            target = by_source_index.get(source_target_index)
+            if target is None:
+                target = {
+                    "name": str(edited.get("name", f"Morph_{len(targets)}")),
+                    "hash": int(edited.get("hash", 0)) & U32_MASK,
+                    "source_index": source_target_index,
+                    "subsets": [],
+                }
+                targets.append(target)
+                if source_target_index >= 0:
+                    by_source_index[source_target_index] = target
+            deltas = dict(edited.get("deltas", {}))
+            topology = (
+                source_slot_topologies[generated_index]
+                if generated_index < len(source_slot_topologies)
+                else None
+            )
+            if topology is not None:
+                export_slot_map = topology.get("export_slot_map", [])
+                mapped_deltas = {}
+                for export_index, delta in deltas.items():
+                    export_index = int(export_index)
+                    if not 0 <= export_index < len(export_slot_map):
+                        raise ValueError(
+                            f"MSMR subset {source_subset_index} morph references a missing export vertex"
+                        )
+                    source_slot = int(export_slot_map[export_index])
+                    previous = mapped_deltas.get(source_slot)
+                    delta = tuple(float(value) for value in delta)
+                    if previous is not None and any(
+                        abs(float(left) - float(right)) > 1.0e-7
+                        for left, right in zip(previous, delta)
+                    ):
+                        raise ValueError(
+                            f"MSMR subset {source_subset_index} morph splits one source vertex into "
+                            "different deltas"
+                        )
+                    mapped_deltas[source_slot] = delta
+                deltas = mapped_deltas
+            if deltas:
+                target["subsets"].append({
+                    "subset_index": source_subset_index,
+                    "deltas": deltas,
+                })
+    return targets
+
+
+def _build_msmr_geometry_blocks(
+    mesh_objects,
+    arm,
+    material_indices,
+    template,
+    source_joint_count,
+    export_warnings=None,
+    source_morph_targets_by_subset=None,
+):
+    original_subset_block = template.payload(BLOCK_HASHES["ModelSubset"])
+    original_count = len(original_subset_block) // MSMR_SUBSET_RECORD_SIZE
+    subset_records = []
+    subset_vertices = []
+    subset_indices = []
+    subset_color_words = []
+    subset_morph_targets = []
+    subset_force_skin = []
+    subset_index_map = {}
+    morph_targets_by_name = {}
+    all_vertices = []
+    all_indices = []
+    color_words = []
+    stats = []
+    vertex_stream_cache = {}
+    index_stream_cache = {}
+    source_geometry = decode_msmr_geometry(template.data, template.blocks)
+    source_slot_topologies = []
+
+    for generated_index, obj in enumerate(mesh_objects):
+        try:
+            old_index = int(obj.get("engine_subset_index", generated_index))
+        except Exception:
+            old_index = generated_index
+        original_record = (
+            original_subset_block[old_index * MSMR_SUBSET_RECORD_SIZE:(old_index + 1) * MSMR_SUBSET_RECORD_SIZE]
+            if 0 <= old_index < original_count
+            else b""
+        )
+        original_flags = struct.unpack_from("<H", original_record, 36)[0] if original_record else 0
+        source_subset = (
+            parse_msmr_subset(
+                template.data,
+                template.blocks[BLOCK_HASHES["ModelSubset"]][0],
+                old_index,
+            )
+            if original_record
+            else None
+        )
+        source_slot_topology = (
+            _msmr_source_slot_topology(obj, arm, source_geometry, source_subset)
+            if source_subset is not None
+            else None
+        )
+        vertices, indices, _has_uv1, _has_uv2, morph_targets, _anim_vert_count = _export_mesh_vertices(
+            obj,
+            arm,
+            source_joint_count,
+            original_flags=original_flags,
+            export_warnings=export_warnings,
+            fallback_morph_targets=(source_morph_targets_by_subset or {}).get(old_index, []),
+        )
+        if not vertices or not indices:
+            raise ValueError(f"{obj.name} has no faces that can be exported")
+        if len(vertices) > MODEL_MAX_VERTEX_COUNT or any(int(index) >= MODEL_MAX_VERTEX_COUNT for index in indices):
+            raise ValueError(f"{obj.name} exceeds MSMR's 16-bit per-subset vertex limit")
+
+        subset_colors = [
+            _msmr_color_word(obj, int(vertex.get("source_index", 0)))
+            for vertex in vertices
+        ]
+        if source_slot_topology is not None:
+            slot_updates = _msmr_source_slot_vertex_updates(
+                vertices,
+                subset_colors,
+                source_slot_topology,
+                source_subset,
+                source_geometry,
+            )
+            if slot_updates is None:
+                source_slot_topology = None
+            else:
+                source_slot_topology.update(slot_updates)
+        source_slot_topologies.append(source_slot_topology)
+        vertex_key = _msmr_vertex_stream_key(vertices, subset_colors)
+        vertex_start = vertex_stream_cache.get(vertex_key)
+        if vertex_start is None:
+            vertex_start = len(all_vertices)
+            vertex_stream_cache[vertex_key] = vertex_start
+            all_vertices.extend(vertices)
+            color_words.extend(subset_colors)
+
+        uses_local_indices = bool(original_flags & 0x10) if original_record else True
+        stored_indices = [
+            int(index) & 0xFFFF
+            if uses_local_indices
+            else (int(index) + int(vertex_start)) & 0xFFFF
+            for index in indices
+        ]
+        encoded_stored_indices = struct.pack(
+            f"<{len(indices)}H",
+            *stored_indices,
+        )
+        index_key = (len(indices), hashlib.sha1(encoded_stored_indices).digest())
+        index_start = index_stream_cache.get(index_key)
+        if index_start is None:
+            index_start = len(all_indices)
+            index_stream_cache[index_key] = index_start
+            all_indices.extend(stored_indices)
+        subset_vertices.append(vertices)
+        subset_indices.append(indices)
+        subset_color_words.append(subset_colors)
+        subset_morph_targets.append(morph_targets)
+        force_skin = bool(original_flags & SUBSET_FLAG_SKINNED) or any(vertex.get("weights") for vertex in vertices)
+        subset_force_skin.append(force_skin)
+        subset_index_map[old_index] = [generated_index]
+
+        record = bytearray(original_record if original_record else b"\x00" * MSMR_SUBSET_RECORD_SIZE)
+        if len(record) < MSMR_SUBSET_RECORD_SIZE:
+            record.extend(b"\x00" * (MSMR_SUBSET_RECORD_SIZE - len(record)))
+        flags = int(original_flags)
+        if not original_record:
+            flags |= 0x10
+        flags = (flags | SUBSET_FLAG_SKINNED) if force_skin else (flags & ~SUBSET_FLAG_SKINNED)
+        struct.pack_into("<IIII", record, 20, vertex_start, index_start, len(indices), len(vertices))
+        struct.pack_into("<HH", record, 36, flags & 0xFFFF, int(material_indices[generated_index]) & 0xFFFF)
+        subset_records.append(record)
+
+        center, extents, radius = _msmr_subset_bounds(vertices)
+        stats.append({
+            "vertex_count": len(vertices),
+            "index_count": len(indices),
+            "center": center,
+            "extents": extents,
+            "radius": radius,
+            "vertices": vertices,
+            "indices": indices,
+            "source_subset_index": old_index,
+        })
+        for target in morph_targets:
+            key = (int(target.get("source_index", -1)), int(target["hash"]) & U32_MASK, str(target["name"]))
+            merged = morph_targets_by_name.setdefault(key, {
+                "name": str(target["name"]),
+                "hash": int(target["hash"]) & U32_MASK,
+                "source_index": int(target.get("source_index", -1)),
+                "subsets": [],
+            })
+            merged["subsets"].append({
+                "subset_index": generated_index,
+                "deltas": target["deltas"],
+            })
+
+    imported_source_indices = [
+        int(stat.get("source_subset_index", -1))
+        for stat in stats
+    ]
+    preserve_source_vertex_layout = (
+        len(imported_source_indices) <= original_count
+        and len(set(imported_source_indices)) == len(imported_source_indices)
+        and all(0 <= subset_index < original_count for subset_index in imported_source_indices)
+        and all(topology is not None for topology in source_slot_topologies)
+        and all(not topology.get("vertex_updates") for topology in source_slot_topologies)
+        and (
+            len(imported_source_indices) < original_count
+            or any(
+                len(topology["slot_map"])
+                < parse_msmr_subset(
+                    template.data,
+                    template.blocks[BLOCK_HASHES["ModelSubset"]][0],
+                    imported_source_indices[generated_index],
+                )["vertex_count"]
+                or len(topology["indices"])
+                < parse_msmr_subset(
+                    template.data,
+                    template.blocks[BLOCK_HASHES["ModelSubset"]][0],
+                    imported_source_indices[generated_index],
+                )["index_count"]
+                for generated_index, topology in enumerate(source_slot_topologies)
+            )
+        )
+    )
+    if preserve_source_vertex_layout:
+        preserved_indices = source_geometry["indices"].astype(np.uint16).tolist()
+        preserved_records = [
+            bytearray(original_subset_block[
+                subset_index * MSMR_SUBSET_RECORD_SIZE:(subset_index + 1) * MSMR_SUBSET_RECORD_SIZE
+            ])
+            for subset_index in range(original_count)
+        ]
+        for generated_index, topology in enumerate(source_slot_topologies):
+            subset_index = imported_source_indices[generated_index]
+            source_subset = parse_msmr_subset(
+                template.data,
+                template.blocks[BLOCK_HASHES["ModelSubset"]][0],
+                subset_index,
+            )
+            stored_indices = [
+                int(index) & 0xFFFF
+                if int(source_subset["flags"]) & 0x10
+                else (int(index) + int(source_subset["vertex_start"])) & 0xFFFF
+                for index in topology["indices"]
+            ]
+            index_start = int(source_subset["index_start"])
+            preserved_indices[index_start:index_start + len(stored_indices)] = stored_indices
+
+            record = preserved_records[subset_index]
+            struct.pack_into("<I", record, 28, len(stored_indices))
+            struct.pack_into("<H", record, 38, int(material_indices[generated_index]) & 0xFFFF)
+
+        built = template.payload(BLOCK_HASHES["ModelBuilt"])
+        position_offset = (
+            tuple(float(value) for value in struct.unpack_from("<3f", built, 28))
+            if len(built) >= 40
+            else tuple(source_geometry["position_offset"])
+        )
+        position_scale = (
+            float(struct.unpack_from("<f", built, 44)[0])
+            if len(built) >= 48
+            else float(source_geometry["position_scale"])
+        )
+        source_uv_logs = struct.unpack_from("<I", built, 48)[0] if len(built) >= 52 else 0
+        replacements = {
+            BLOCK_HASHES["ModelSubset"]: b"".join(bytes(record) for record in preserved_records),
+            MSMR_MODEL_INDEX_HASH: encode_msmr_index_stream(preserved_indices),
+            MSMR_MODEL_STD_VERT_HASH: template.payload(MSMR_MODEL_STD_VERT_HASH),
+        }
+        return {
+            "replacements": replacements,
+            "stats": stats,
+            "subset_index_map": {
+                subset_index: [subset_index]
+                for subset_index in range(original_count)
+            },
+            "morph_targets": [],
+            "position_offset": position_offset,
+            "position_scale": position_scale,
+            "uv_logs": source_uv_logs,
+            "vertex_count": len(source_geometry["positions"]),
+            "index_count": len(source_geometry["indices"]),
+            "source_geometry_unchanged": (
+                replacements[MSMR_MODEL_INDEX_HASH] == template.payload(MSMR_MODEL_INDEX_HASH)
+            ),
+            "source_vertex_layout_preserved": True,
+            "source_subset_layout_preserved": True,
+            "preserve_source_morphs": True,
+        }
+
+    # Keep the complete source subset table (including unimported LODs) when
+    # only some imported subsets require new vertex allocations. Compatible
+    # subsets continue to reference their original vertex and skin ranges;
+    # incompatible subsets are appended to the shared streams and get new
+    # skin batches. This avoids rebuilding or renumbering otherwise untouched
+    # LOD geometry merely because one visible subset was replaced or joined.
+    preserve_source_subset_layout = (
+        len(imported_source_indices) <= original_count
+        and len(set(imported_source_indices)) == len(imported_source_indices)
+        and all(0 <= subset_index < original_count for subset_index in imported_source_indices)
+        and any(
+            topology is None or topology.get("vertex_updates")
+            for topology in source_slot_topologies
+        )
+    )
+    if preserve_source_subset_layout:
+        preserved_records = [
+            bytearray(original_subset_block[
+                subset_index * MSMR_SUBSET_RECORD_SIZE:(subset_index + 1) * MSMR_SUBSET_RECORD_SIZE
+            ])
+            for subset_index in range(original_count)
+        ]
+        preserved_indices = source_geometry["indices"].astype(np.uint16).tolist()
+        source_vertex_count = len(source_geometry["positions"])
+        appended_vertices = []
+        appended_colors = []
+        rebuilt_generated_indices = []
+        changed_generated_indices = []
+        source_vertex_updates = {}
+
+        for generated_index, topology in enumerate(source_slot_topologies):
+            subset_index = imported_source_indices[generated_index]
+            source_subset = parse_msmr_subset(
+                template.data,
+                template.blocks[BLOCK_HASHES["ModelSubset"]][0],
+                subset_index,
+            )
+            record = preserved_records[subset_index]
+            struct.pack_into(
+                "<H",
+                record,
+                38,
+                int(material_indices[generated_index]) & 0xFFFF,
+            )
+            if topology is not None:
+                vertex_updates = dict(topology.get("vertex_updates", {}))
+                if vertex_updates:
+                    changed_generated_indices.append(generated_index)
+                    source_vertex_updates.update(vertex_updates)
+                stored_indices = [
+                    int(index) & 0xFFFF
+                    if int(source_subset["flags"]) & 0x10
+                    else (int(index) + int(source_subset["vertex_start"])) & 0xFFFF
+                    for index in topology["indices"]
+                ]
+                index_start = int(source_subset["index_start"])
+                preserved_indices[index_start:index_start + len(stored_indices)] = stored_indices
+                struct.pack_into("<I", record, 28, len(stored_indices))
+                continue
+
+            vertices = subset_vertices[generated_index]
+            indices = subset_indices[generated_index]
+            vertex_start = source_vertex_count + len(appended_vertices)
+            index_start = len(preserved_indices)
+            uses_local_indices = bool(int(source_subset["flags"]) & 0x10)
+            if not uses_local_indices and any(
+                int(index) + vertex_start > 0xFFFF
+                for index in indices
+            ):
+                raise ValueError(
+                    f"MSMR subset {subset_index} uses global 16-bit indices and cannot be appended "
+                    "after the source vertex stream"
+                )
+            stored_indices = [
+                int(index) & 0xFFFF
+                if uses_local_indices
+                else int(index) + vertex_start
+                for index in indices
+            ]
+            preserved_indices.extend(stored_indices)
+            appended_vertices.extend(vertices)
+            appended_colors.extend(subset_color_words[generated_index])
+            rebuilt_generated_indices.append(generated_index)
+
+            flags = int(source_subset["flags"])
+            flags = (
+                flags | SUBSET_FLAG_SKINNED
+                if subset_force_skin[generated_index]
+                else flags & ~SUBSET_FLAG_SKINNED
+            )
+            struct.pack_into(
+                "<IIII",
+                record,
+                20,
+                vertex_start,
+                index_start,
+                len(indices),
+                len(vertices),
+            )
+            struct.pack_into("<H", record, 36, flags & 0xFFFF)
+
+        source_skin_data = bytearray(
+            template.payload(MSMR_MODEL_SKIN_DATA_HASH)
+            if MSMR_MODEL_SKIN_DATA_HASH in template.blocks
+            else b""
+        )
+        source_skin_batches = bytearray(
+            template.payload(MSMR_MODEL_SKIN_BATCH_HASH)
+            if MSMR_MODEL_SKIN_BATCH_HASH in template.blocks
+            else b""
+        )
+        source_joint_remaps = bytearray(
+            template.payload(MSMR_MODEL_SKIN_JOINT_REMAP_HASH)
+            if MSMR_MODEL_SKIN_JOINT_REMAP_HASH in template.blocks
+            else b""
+        )
+        if len(source_skin_batches) % 16:
+            raise ValueError("The original MSMR Model Skin Batch block is truncated")
+        if any(subset_force_skin[index] for index in rebuilt_generated_indices) and (
+            MSMR_MODEL_SKIN_DATA_HASH not in template.blocks
+            or MSMR_MODEL_SKIN_BATCH_HASH not in template.blocks
+        ):
+            raise ValueError(
+                "The original MSMR model has no skin streams, so weighted meshes cannot be added to it"
+            )
+
+        rebuilt_skin_data, rebuilt_skin_batches, rebuilt_joint_remaps, rebuilt_batch_ranges = (
+            _build_msmr_skin_blocks(
+                [subset_vertices[index] for index in rebuilt_generated_indices],
+                [subset_indices[index] for index in rebuilt_generated_indices],
+                [subset_force_skin[index] for index in rebuilt_generated_indices],
+                MSMR_MODEL_SKIN_JOINT_REMAP_HASH in template.blocks,
+                source_joint_count=source_joint_count,
+            )
+        )
+        skin_data_base = len(source_skin_data)
+        if rebuilt_skin_data:
+            _align_buffer(source_skin_data, DAT1_BLOCK_ALIGN)
+            skin_data_base = len(source_skin_data)
+            source_skin_data.extend(rebuilt_skin_data)
+        joint_remap_base = len(source_joint_remaps)
+        if rebuilt_joint_remaps:
+            _align_buffer(source_joint_remaps, DAT1_BLOCK_ALIGN)
+            joint_remap_base = len(source_joint_remaps)
+            source_joint_remaps.extend(rebuilt_joint_remaps)
+        first_new_batch = len(source_skin_batches) // 16
+        for batch_offset in range(0, len(rebuilt_skin_batches), 16):
+            (
+                data_offset,
+                remap_offset,
+                remap_count,
+                unknown,
+                count,
+                first_vertex,
+            ) = struct.unpack_from("<IIHHHH", rebuilt_skin_batches, batch_offset)
+            source_skin_batches.extend(struct.pack(
+                "<IIHHHH",
+                int(data_offset) + skin_data_base,
+                int(remap_offset) + joint_remap_base if remap_count else 0,
+                remap_count,
+                unknown,
+                count,
+                first_vertex,
+            ))
+        for generated_index, (relative_first, batch_count) in zip(
+            rebuilt_generated_indices,
+            rebuilt_batch_ranges,
+        ):
+            subset_index = imported_source_indices[generated_index]
+            first_batch = first_new_batch + int(relative_first) if batch_count else 0
+            if first_batch > 0xFFFF or int(batch_count) > 0xFF:
+                raise ValueError(f"MSMR subset {subset_index} has too many skin batches")
+            struct.pack_into("<H", preserved_records[subset_index], 40, first_batch)
+            preserved_records[subset_index][42] = int(batch_count)
+
+        built = template.payload(BLOCK_HASHES["ModelBuilt"])
+        source_offset = (
+            struct.unpack_from("<3f", built, 28)
+            if len(built) >= 40
+            else tuple(source_geometry["position_offset"])
+        )
+        source_scale = (
+            struct.unpack_from("<f", built, 44)[0]
+            if len(built) >= 48
+            else float(source_geometry["position_scale"])
+        )
+        fit_vertices = []
+        for vertex_index in range(source_vertex_count):
+            updated = source_vertex_updates.get(vertex_index)
+            fit_vertices.append(
+                updated[0]
+                if updated is not None
+                else {
+                    "co": tuple(
+                        float(value)
+                        for value in source_geometry["positions"][vertex_index]
+                    )
+                }
+            )
+        fit_vertices.extend(appended_vertices)
+        position_offset, position_scale = _fit_msmr_position_quantization(
+            fit_vertices,
+            source_offset,
+            source_scale,
+        )
+        source_uv_logs = struct.unpack_from("<I", built, 48)[0] if len(built) >= 52 else 0
+        uv_log = max(
+            source_uv_logs & 0xF,
+            _uv_log_for_values(appended_vertices, "uv0"),
+        )
+        total_vertex_count = source_vertex_count + len(appended_vertices)
+        values = np.empty((6, total_vertex_count), dtype=np.int16)
+        normal_words = np.empty(total_vertex_count, dtype=np.uint32)
+        for vertex_index in range(source_vertex_count):
+            updated = source_vertex_updates.get(vertex_index)
+            vertex = updated[0] if updated is not None else None
+            co = vertex["co"] if vertex is not None else source_geometry["positions"][vertex_index]
+            values[0:3, vertex_index] = [
+                _clamp_i16((float(co[axis]) - position_offset[axis]) / position_scale)
+                for axis in range(3)
+            ]
+            values[3, vertex_index] = _clamp_i16(
+                vertex["position_w"]
+                if vertex is not None
+                else source_geometry["position_ws"][vertex_index]
+            )
+            values[4:6, vertex_index] = _pack_uv(
+                vertex.get("uv0", (0.0, 0.0))
+                if vertex is not None
+                else source_geometry["uv0"][vertex_index],
+                uv_log,
+            )
+            normal_words[vertex_index] = (
+                int(vertex["normal_tangent"])
+                if vertex is not None
+                else int(source_geometry["normal_words"][vertex_index])
+            ) & U32_MASK
+        for appended_index, vertex in enumerate(appended_vertices, start=source_vertex_count):
+            co = vertex["co"]
+            values[0:3, appended_index] = [
+                _clamp_i16((float(co[axis]) - position_offset[axis]) / position_scale)
+                for axis in range(3)
+            ]
+            values[3, appended_index] = _clamp_i16(vertex["position_w"])
+            values[4:6, appended_index] = _pack_uv(vertex.get("uv0", (0.0, 0.0)), uv_log)
+            normal_words[appended_index] = int(vertex["normal_tangent"]) & U32_MASK
+
+        replacements = {
+            BLOCK_HASHES["ModelSubset"]: b"".join(bytes(record) for record in preserved_records),
+            MSMR_MODEL_INDEX_HASH: encode_msmr_index_stream(preserved_indices),
+            MSMR_MODEL_STD_VERT_HASH: encode_msmr_vertex_stream(normal_words, values),
+        }
+        if MSMR_MODEL_SKIN_DATA_HASH in template.blocks:
+            replacements[MSMR_MODEL_SKIN_DATA_HASH] = bytes(source_skin_data)
+        if MSMR_MODEL_SKIN_BATCH_HASH in template.blocks:
+            replacements[MSMR_MODEL_SKIN_BATCH_HASH] = bytes(source_skin_batches)
+        if MSMR_MODEL_SKIN_JOINT_REMAP_HASH in template.blocks:
+            replacements[MSMR_MODEL_SKIN_JOINT_REMAP_HASH] = bytes(source_joint_remaps)
+        if MSMR_MODEL_UV1_VERT_HASH in template.blocks:
+            source_uv1 = source_geometry.get("uv1")
+            if source_uv1 is None:
+                raise ValueError("The original MSMR UV1 stream could not be decoded")
+            uv1_values = np.empty((total_vertex_count, 2), dtype="<i2")
+            for vertex_index in range(source_vertex_count):
+                updated = source_vertex_updates.get(vertex_index)
+                vertex = updated[0] if updated is not None else None
+                uv1 = (
+                    vertex.get("uv1") or (0.0, 0.0)
+                    if vertex is not None
+                    else source_uv1[vertex_index]
+                )
+                uv1_values[vertex_index] = (
+                    _clamp_i16(float(uv1[0]) * 32768.0),
+                    _clamp_i16(float(uv1[1]) * 32768.0),
+                )
+            for appended_index, vertex in enumerate(appended_vertices, start=source_vertex_count):
+                uv1 = vertex.get("uv1") or (0.0, 0.0)
+                uv1_values[appended_index] = (
+                    _clamp_i16(float(uv1[0]) * 32768.0),
+                    _clamp_i16(float(uv1[1]) * 32768.0),
+                )
+            replacements[MSMR_MODEL_UV1_VERT_HASH] = uv1_values.tobytes()
+        if MSMR_MODEL_COL_VERT_HASH in template.blocks:
+            source_colors = source_geometry.get("color_words")
+            if source_colors is None:
+                raise ValueError("The original MSMR color stream could not be decoded")
+            hybrid_colors = np.concatenate((
+                np.asarray(source_colors, dtype="<u4"),
+                np.asarray(appended_colors, dtype="<u4"),
+            ))
+            for vertex_index, (_vertex, color_word) in source_vertex_updates.items():
+                hybrid_colors[vertex_index] = int(color_word) & U32_MASK
+            replacements[MSMR_MODEL_COL_VERT_HASH] = hybrid_colors.astype("<u4", copy=False).tobytes()
+
+        return {
+            "replacements": replacements,
+            "stats": stats,
+            "subset_index_map": {
+                subset_index: [subset_index]
+                for subset_index in range(original_count)
+            },
+            "morph_targets": _msmr_hybrid_morph_targets(
+                template,
+                subset_morph_targets,
+                imported_source_indices,
+                rebuilt_generated_indices + changed_generated_indices,
+                source_slot_topologies,
+            ),
+            "position_offset": position_offset,
+            "position_scale": position_scale,
+            "uv_logs": (source_uv_logs & ~0xF) | uv_log,
+            "vertex_count": total_vertex_count,
+            "index_count": len(preserved_indices),
+            "source_geometry_unchanged": (
+                replacements[MSMR_MODEL_INDEX_HASH] == template.payload(MSMR_MODEL_INDEX_HASH)
+                and replacements[MSMR_MODEL_STD_VERT_HASH] == template.payload(MSMR_MODEL_STD_VERT_HASH)
+            ),
+            "source_vertex_layout_preserved": not rebuilt_generated_indices,
+            "source_subset_layout_preserved": True,
+            "preserve_source_morphs": False,
+        }
+
+    for subset_index, vertices in enumerate(subset_vertices):
+        if not subset_force_skin[subset_index]:
+            continue
+        repaired_count, fallback_count = _repair_missing_skin_weights(
+            vertices,
+            subset_indices[subset_index],
+        )
+        if repaired_count:
+            log_warning(
+                "MSMR subset %d repaired %d missing skin weights (%d fallback)",
+                subset_index,
+                repaired_count,
+                fallback_count,
+            )
+
+    preserve_source_skin = (
+        all(
+            int(stat.get("source_subset_index", -1)) == subset_index
+            for subset_index, stat in enumerate(stats)
+        )
+        and _msmr_source_skin_matches(
+            template,
+            subset_vertices,
+            subset_force_skin,
+            source_joint_count,
+        )
+    )
+    if preserve_source_skin:
+        skin_data = template.payload(MSMR_MODEL_SKIN_DATA_HASH)
+        skin_batches = template.payload(MSMR_MODEL_SKIN_BATCH_HASH)
+        joint_remaps = (
+            template.payload(MSMR_MODEL_SKIN_JOINT_REMAP_HASH)
+            if MSMR_MODEL_SKIN_JOINT_REMAP_HASH in template.blocks
+            else b""
+        )
+        batch_ranges = [
+            (
+                struct.unpack_from("<H", record, 40)[0],
+                int(record[42]),
+            )
+            for record in subset_records
+        ]
+    else:
+        skin_data, skin_batches, joint_remaps, batch_ranges = _build_msmr_skin_blocks(
+            subset_vertices,
+            subset_indices,
+            subset_force_skin,
+            MSMR_MODEL_SKIN_JOINT_REMAP_HASH in template.blocks,
+            template=template,
+            source_joint_count=source_joint_count,
+            source_subset_indices=[
+                int(stat.get("source_subset_index", subset_index))
+                for subset_index, stat in enumerate(stats)
+            ],
+        )
+    for record, (first_batch, batch_count) in zip(subset_records, batch_ranges):
+        struct.pack_into("<H", record, 40, first_batch)
+        record[42] = batch_count
+
+    built = template.payload(BLOCK_HASHES["ModelBuilt"])
+    source_offset = struct.unpack_from("<3f", built, 28) if len(built) >= 40 else (0.0, 0.0, 0.0)
+    source_scale = struct.unpack_from("<f", built, 44)[0] if len(built) >= 48 else 1.0 / 4096.0
+    position_offset, position_scale = _fit_msmr_position_quantization(
+        all_vertices,
+        source_offset,
+        source_scale,
+    )
+    source_uv_logs = struct.unpack_from("<I", built, 48)[0] if len(built) >= 52 else 0
+    uv_log = max(source_uv_logs & 0xF, _uv_log_for_values(all_vertices, "uv0"))
+
+    values = np.empty((6, len(all_vertices)), dtype=np.int16)
+    normal_words = np.empty(len(all_vertices), dtype=np.uint32)
+    for vertex_index, vertex in enumerate(all_vertices):
+        co = vertex["co"]
+        values[0:3, vertex_index] = [
+            _clamp_i16((float(co[axis]) - position_offset[axis]) / position_scale)
+            for axis in range(3)
+        ]
+        values[3, vertex_index] = _clamp_i16(vertex["position_w"])
+        values[4:6, vertex_index] = _pack_uv(vertex.get("uv0", (0.0, 0.0)), uv_log)
+        normal_words[vertex_index] = int(vertex["normal_tangent"]) & U32_MASK
+
+    replacements = {
+        BLOCK_HASHES["ModelSubset"]: b"".join(bytes(record) for record in subset_records),
+        MSMR_MODEL_INDEX_HASH: encode_msmr_index_stream(all_indices),
+        MSMR_MODEL_STD_VERT_HASH: encode_msmr_vertex_stream(normal_words, values),
+    }
+    if skin_data or skin_batches:
+        if (
+            MSMR_MODEL_SKIN_DATA_HASH not in template.blocks
+            or MSMR_MODEL_SKIN_BATCH_HASH not in template.blocks
+        ):
+            raise ValueError(
+                "The original MSMR model has no skin streams, so weighted meshes cannot be added to it"
+            )
+        replacements[MSMR_MODEL_SKIN_DATA_HASH] = skin_data
+        replacements[MSMR_MODEL_SKIN_BATCH_HASH] = skin_batches
+    else:
+        if MSMR_MODEL_SKIN_DATA_HASH in template.blocks:
+            replacements[MSMR_MODEL_SKIN_DATA_HASH] = b""
+        if MSMR_MODEL_SKIN_BATCH_HASH in template.blocks:
+            replacements[MSMR_MODEL_SKIN_BATCH_HASH] = b""
+    if MSMR_MODEL_SKIN_JOINT_REMAP_HASH in template.blocks:
+        replacements[MSMR_MODEL_SKIN_JOINT_REMAP_HASH] = joint_remaps
+    if MSMR_MODEL_UV1_VERT_HASH in template.blocks:
+        uv1_values = np.empty((len(all_vertices), 2), dtype="<i2")
+        for vertex_index, vertex in enumerate(all_vertices):
+            uv1 = vertex.get("uv1") or (0.0, 0.0)
+            uv1_values[vertex_index] = (
+                _clamp_i16(float(uv1[0]) * 32768.0),
+                _clamp_i16(float(uv1[1]) * 32768.0),
+            )
+        replacements[MSMR_MODEL_UV1_VERT_HASH] = uv1_values.tobytes()
+    if MSMR_MODEL_COL_VERT_HASH in template.blocks:
+        replacements[MSMR_MODEL_COL_VERT_HASH] = np.asarray(color_words, dtype="<u4").tobytes()
+
+    source_geometry_unchanged = (
+        replacements[MSMR_MODEL_INDEX_HASH] == template.payload(MSMR_MODEL_INDEX_HASH)
+        and replacements[MSMR_MODEL_STD_VERT_HASH] == template.payload(MSMR_MODEL_STD_VERT_HASH)
+    )
+
+    return {
+        "replacements": replacements,
+        "stats": stats,
+        "subset_index_map": subset_index_map,
+        "morph_targets": list(morph_targets_by_name.values()),
+        "position_offset": position_offset,
+        "position_scale": position_scale,
+        "uv_logs": (source_uv_logs & ~0xF) | uv_log,
+        "vertex_count": len(all_vertices),
+        "index_count": len(all_indices),
+        "source_geometry_unchanged": source_geometry_unchanged,
+    }
+
+
+def _build_msmr_look_blocks(subset_count, string_pool, template, arm, subset_index_map):
+    original_look = template.payload(BLOCK_HASHES["ModelLook"])
+    original_built = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+    source_look_count = len(original_look) // 32
+    source_built_count = min(source_look_count, len(original_built) // MODEL_LOOK_BUILT_SIZE)
+    looks = _json_list_from_idprop(arm, "engine_model_looks_json")
+    groups = _json_list_from_idprop(arm, "engine_model_look_groups_json")
+    if not looks:
+        looks = [{
+            "index": 0,
+            "name": "default",
+            "name_hash": string_crc32("default"),
+            "subset_ids": list(subset_index_map),
+            "lods": [{"start": 0, "count": len(subset_index_map)} for _ in range(8)],
+        }]
+
+    def source_header(index):
+        if not 0 <= int(index) < source_built_count:
+            return None
+        offset = int(index) * MODEL_LOOK_BUILT_SIZE
+        offsets = list(struct.unpack_from("<7Q", original_built, offset))
+        counts = list(struct.unpack_from("<6H", original_built, offset + 56))
+        return offsets, counts
+
+    def source_section(index, section):
+        header = source_header(index)
+        if not header:
+            return b"", 0
+        offsets, counts = header
+        start = int(offsets[section])
+        if start < 0 or start >= len(original_built):
+            return b"", 0
+        if section < 6:
+            size = int(counts[section]) * 2
+        else:
+            candidates = [len(original_built)]
+            for other_index in range(source_built_count):
+                other = source_header(other_index)
+                if not other:
+                    continue
+                candidates.extend(
+                    int(value) for value in other[0]
+                    if start < int(value) <= len(original_built)
+                )
+            size = min(candidates) - start
+        if size <= 0 or start + size > len(original_built):
+            return b"", 0
+        return bytes(original_built[start:start + size]), int(counts[section]) if section < 6 else 0
+
+    look_defs = []
+    look_block = bytearray()
+    for look_index, look_info in enumerate(looks):
+        source_ids = [int(value) for value in look_info.get("subset_ids", [])]
+        lods = list(look_info.get("lods", []) or [])
+        mapped_lods = []
+        union = []
+        for lod_index in range(8):
+            lod = lods[lod_index] if lod_index < len(lods) else {"start": 0, "count": 0}
+            start = max(0, int(lod.get("start", 0)))
+            count = max(0, int(lod.get("count", 0)))
+            mapped = _mapped_subset_ids(
+                source_ids[start:start + count],
+                subset_index_map,
+                subset_count,
+                allow_direct=True,
+            )
+            mapped = sorted(mapped)
+            if mapped and mapped != list(range(mapped[0], mapped[0] + len(mapped))):
+                raise ValueError(
+                    f"MSMR look {look_info.get('name', look_index)!r} LOD {lod_index} is not a contiguous "
+                    "subset range. Reorder the model subsets or adjust the look before exporting."
+                )
+            mapped_lods.append((mapped[0], len(mapped)) if mapped else (0, 0))
+            for subset_index in mapped:
+                if subset_index not in union:
+                    union.append(subset_index)
+
+        source_index = int(look_info.get("index", look_index))
+        source_record_offset = source_index * 32
+        record = bytearray(
+            original_look[source_record_offset:source_record_offset + 32]
+            if 0 <= source_index < source_look_count
+            else b"\x00" * 32
+        )
+        for lod_index, (start, count) in enumerate(mapped_lods):
+            struct.pack_into("<HH", record, lod_index * 4, start, count)
+        look_block += record
+
+        name = str(look_info.get("name", "") or f"Look {look_index}")
+        name_hash = int(look_info.get("name_hash", 0) or string_crc32(name)) & U32_MASK
+        look_defs.append({
+            "name": name,
+            "hash": name_hash,
+            "offset": string_pool.add(name),
+            "ids": sorted(union),
+            "source_index": source_index,
+        })
+
+    headers_size = len(look_defs) * MODEL_LOOK_BUILT_SIZE
+    headers = bytearray()
+    data = bytearray()
+    for look_index, look_def in enumerate(look_defs):
+        ids = look_def["ids"]
+        section_offsets = [headers_size + len(data)]
+        section_counts = [len(ids)]
+        if ids:
+            data += struct.pack(f"<{len(ids)}H", *ids)
+        for section_index in range(1, 7):
+            section, count = source_section(look_def["source_index"], section_index)
+            section_offsets.append(headers_size + len(data))
+            if section_index < 6:
+                section_counts.append(count)
+            data += section
+        headers += struct.pack(
+            "<7Q6H3I",
+            *section_offsets,
+            *section_counts,
+            look_def["hash"],
+            look_def["hash"],
+            look_def["offset"],
+        )
+
+    look_group = _build_look_group_block(groups, len(look_defs), string_pool)
+    return bytes(look_block), bytes(headers + data), look_group
+
+
+def _build_msmr_model_built_block(template, geometry):
+    original = bytearray(template.payload(BLOCK_HASHES["ModelBuilt"]))
+    if len(original) < 120:
+        original.extend(b"\x00" * (120 - len(original)))
+    source_center = struct.unpack_from("<3f", original, 0)
+    source_radius = struct.unpack_from("<f", original, 12)[0]
+    source_extents = struct.unpack_from("<3f", original, 16)
+    source_bounds = None
+    if (
+        all(math.isfinite(value) for value in source_center + source_extents)
+        and math.isfinite(source_radius)
+        and source_radius > 0.0
+        and all(value >= 0.0 for value in source_extents)
+    ):
+        source_bounds = (source_center, source_extents, source_radius)
+    containment_tolerance = max(float(geometry["position_scale"]) * 2.0, 1.0e-5)
+    source_contains_geometry = bool(source_bounds)
+    if source_contains_geometry:
+        radius_limit_squared = (float(source_radius) + containment_tolerance) ** 2
+        for stat in geometry["stats"]:
+            for vertex in stat.get("vertices", ()):
+                co = tuple(float(value) for value in vertex["co"])
+                if any(
+                    abs(co[axis] - float(source_center[axis]))
+                    > float(source_extents[axis]) + containment_tolerance
+                    for axis in range(3)
+                ):
+                    source_contains_geometry = False
+                    break
+                if sum(
+                    (co[axis] - float(source_center[axis])) ** 2
+                    for axis in range(3)
+                ) > radius_limit_squared:
+                    source_contains_geometry = False
+                    break
+            if not source_contains_geometry:
+                break
+    if source_contains_geometry:
+        center, extents, radius = source_bounds
+    else:
+        center, extents, radius = _combine_model_bounds(
+            source_bounds,
+            geometry["stats"],
+            containment_tolerance=containment_tolerance,
+        )
+    struct.pack_into("<4f", original, 0, *center, radius)
+    struct.pack_into("<3f", original, 16, *extents)
+    struct.pack_into("<3f", original, 28, *geometry["position_offset"])
+    struct.pack_into("<f", original, 44, float(geometry["position_scale"]))
+    struct.pack_into("<I", original, 48, int(geometry["uv_logs"]) & U32_MASK)
+    struct.pack_into("<II", original, 100, int(geometry["index_count"]), int(geometry["vertex_count"]))
+    return bytes(original)
+
+
+def _build_msmr_morph_blocks(
+    template,
+    edited_targets,
+    string_pool,
+):
+    source = decode_msmr_morphs(template.data, template.blocks)
+    if source is None:
+        return None
+    edited_by_index = {
+        int(target.get("source_index", -1)): target
+        for target in edited_targets
+        if int(target.get("source_index", -1)) >= 0
+    }
+    encoded_targets = []
+    used_edited = set()
+    for source_index, source_target in enumerate(source.get("targets", [])):
+        edited = edited_by_index.get(source_index)
+        if edited is not None:
+            used_edited.add(id(edited))
+        target = {
+            "name": str((edited or source_target).get("name", source_target.get("name", f"Morph_{source_index}"))),
+            "hash": int((edited or source_target).get("hash", source_target.get("hash", 0))) & U32_MASK,
+            "subsets": list((edited or {}).get("subsets", [])),
+            "packing_kind": int(source_target.get("packing_kind", 1)),
+            "packing_null": int(source_target.get("packing_null", 0)),
+            "component_bits": int(source_target.get("component_bits", 16)),
+            "normal_scale": float(source_target.get("normal_scale", 0.0)),
+            "normal_bias": float(source_target.get("normal_bias", 0.0)),
+        }
+        target["name_offset"] = string_pool.add(target["name"])
+        encoded_targets.append(target)
+    for edited in edited_targets:
+        if id(edited) in used_edited:
+            continue
+        target = dict(edited)
+        target["name_offset"] = string_pool.add(target["name"])
+        target.setdefault("component_bits", 16)
+        encoded_targets.append(target)
+    preserve_source_morphs = len(encoded_targets) == len(source.get("targets", []))
+    if preserve_source_morphs:
+        for source_target, encoded_target in zip(source.get("targets", []), encoded_targets):
+            if int(source_target.get("hash", 0)) != int(encoded_target.get("hash", 0)):
+                preserve_source_morphs = False
+                break
+            source_subsets = {
+                int(subset.get("subset_index", -1)): {
+                    int(vertex_index): tuple(float(value) for value in delta)
+                    for vertex_index, delta in subset.get("deltas", {}).items()
+                }
+                for subset in source_target.get("subsets", [])
+                if subset.get("deltas")
+            }
+            encoded_subsets = {
+                int(subset.get("subset_index", -1)): {
+                    int(vertex_index): tuple(float(value) for value in delta)
+                    for vertex_index, delta in subset.get("deltas", {}).items()
+                }
+                for subset in encoded_target.get("subsets", [])
+                if subset.get("deltas")
+            }
+            if source_subsets.keys() != encoded_subsets.keys():
+                preserve_source_morphs = False
+                break
+            for subset_index, source_deltas in source_subsets.items():
+                encoded_deltas = encoded_subsets[subset_index]
+                if source_deltas.keys() != encoded_deltas.keys():
+                    preserve_source_morphs = False
+                    break
+                if any(
+                    any(
+                        abs(left - right) > 1.0e-7
+                        for left, right in zip(delta, encoded_deltas[vertex_index])
+                    )
+                    for vertex_index, delta in source_deltas.items()
+                ):
+                    preserve_source_morphs = False
+                    break
+            if not preserve_source_morphs:
+                break
+    if preserve_source_morphs:
+        return {
+            MSMR_MODEL_ANIM_MORPH_INFO_HASH: template.payload(MSMR_MODEL_ANIM_MORPH_INFO_HASH),
+            MSMR_MODEL_ANIM_MORPH_DATA_HASH: template.payload(MSMR_MODEL_ANIM_MORPH_DATA_HASH),
+            MSMR_MODEL_ANIM_MORPH_INDICES_HASH: template.payload(MSMR_MODEL_ANIM_MORPH_INDICES_HASH),
+        }, len(encoded_targets)
+    info, deltas, indices = encode_msmr_morphs(
+        encoded_targets,
+        source.get("mirrors", []),
+        source.get("version", 2),
+    )
+    return {
+        MSMR_MODEL_ANIM_MORPH_INFO_HASH: info,
+        MSMR_MODEL_ANIM_MORPH_DATA_HASH: deltas,
+        MSMR_MODEL_ANIM_MORPH_INDICES_HASH: indices,
+    }, len(encoded_targets)
+
+
 def _json_list_from_idprop(owner, key):
     try:
         data = json.loads(str(owner.get(key, "[]") or "[]"))
     except Exception:
         return []
     return data if isinstance(data, list) else []
+
+
+def _msmr_lod0_scene_looks_match_source(arm, template):
+    """Detect a stale modified flag when a LOD0-only scene still matches its source looks."""
+    looks = _json_list_from_idprop(arm, "engine_model_looks_json")
+    groups = _json_list_from_idprop(arm, "engine_model_look_groups_json")
+    source_look = template.payload(BLOCK_HASHES["ModelLook"])
+    source_built = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+    source_look_count = len(source_look) // 32
+    if len(source_look) % 32 or len(looks) != source_look_count:
+        return False
+
+    seen_source_indices = set()
+    for fallback_index, look in enumerate(looks):
+        source_index = int(look.get("index", fallback_index))
+        if not 0 <= source_index < source_look_count or source_index in seen_source_indices:
+            return False
+        seen_source_indices.add(source_index)
+        source_start, source_count = struct.unpack_from("<HH", source_look, source_index * 32)
+        source_ids = [int(value) for value in look.get("subset_ids", [])]
+        lods = list(look.get("lods", []) or [])
+        lod0 = lods[0] if lods else {"start": 0, "count": 0}
+        start = max(0, int(lod0.get("start", 0)))
+        count = max(0, int(lod0.get("count", 0)))
+        if source_ids[start:start + count] != list(range(source_start, source_start + source_count)):
+            return False
+        built_offset = source_index * MODEL_LOOK_BUILT_SIZE
+        if built_offset + MODEL_LOOK_BUILT_SIZE <= len(source_built):
+            source_name_hash = struct.unpack_from("<I", source_built, built_offset + 72)[0]
+            if int(look.get("name_hash", 0)) & U32_MASK != int(source_name_hash) & U32_MASK:
+                return False
+
+    try:
+        source_groups = parse_msmr_look_groups_metadata(template.data, template.blocks)
+    except Exception:
+        return False
+    if len(groups) != len(source_groups):
+        return False
+    source_groups_by_index = {
+        int(group.get("index", index)): group
+        for index, group in enumerate(source_groups)
+    }
+    for fallback_index, group in enumerate(groups):
+        source_index = int(group.get("index", fallback_index))
+        source_group = source_groups_by_index.get(source_index)
+        if source_group is None:
+            return False
+        if int(group.get("name_hash", 0)) & U32_MASK != int(source_group.get("name_hash", 0)) & U32_MASK:
+            return False
+        if [int(value) for value in group.get("look_indices", [])] != [
+            int(value) for value in source_group.get("look_indices", [])
+        ]:
+            return False
+    return True
 
 
 def _mapped_subset_ids(source_ids, subset_index_map, subset_count, allow_direct=False):
@@ -2287,7 +4143,8 @@ def _model_mpu_from_bounds(center, extents):
     return vertex_range / float(1 << 15)
 
 
-def _combine_model_bounds(source_bounds, subset_stats):
+def _combine_model_bounds(source_bounds, subset_stats, containment_tolerance=0.0):
+    containment_tolerance = max(0.0, float(containment_tolerance))
     bounds = []
     radius_sources = []
     if source_bounds:
@@ -2303,13 +4160,22 @@ def _combine_model_bounds(source_bounds, subset_stats):
                 center = tuple(float(stat["center"][axis]) for axis in range(3))
                 extents = tuple(float(stat["extents"][axis]) for axis in range(3))
                 radius = float(stat.get("radius", 0.0))
-                if any(center[axis] - extents[axis] < source_mins[axis] for axis in range(3)):
+                if any(
+                    center[axis] - extents[axis] < source_mins[axis] - containment_tolerance
+                    for axis in range(3)
+                ):
                     all_inside_source = False
                     break
-                if any(center[axis] + extents[axis] > source_maxs[axis] for axis in range(3)):
+                if any(
+                    center[axis] + extents[axis] > source_maxs[axis] + containment_tolerance
+                    for axis in range(3)
+                ):
                     all_inside_source = False
                     break
-                if _vec_len(_vec_sub(center, source_center)) + radius > source_radius:
+                if (
+                    _vec_len(_vec_sub(center, source_center)) + radius
+                    > source_radius + containment_tolerance
+                ):
                     all_inside_source = False
                     break
             if all_inside_source:
@@ -2548,7 +4414,17 @@ def _relocate_model_string_offsets(block_hash, payload, delta):
     return bytes(data)
 
 
-def _rebuild_dat1(template, replacements, string_pool, remove_hashes=None):
+def _rebuild_dat1(
+    template,
+    replacements,
+    string_pool,
+    remove_hashes=None,
+    bulk_hash=None,
+    bulk_at_end=True,
+    pad_bulk_block=True,
+    alignment_override=None,
+    preserve_original_offsets=False,
+):
     if template.fixup_count != 0:
         raise ValueError(
             "This particular game-model layout is not supported yet. Try a different original .model file. "
@@ -2561,12 +4437,12 @@ def _rebuild_dat1(template, replacements, string_pool, remove_hashes=None):
         for entry in sorted(template.entries, key=lambda item: item[1])
         if entry[0] not in remove_hashes
     ]
-    geom_hash = BLOCK_HASHES["ModelSubsetGeomData"]
+    geom_hash = int(bulk_hash if bulk_hash is not None else BLOCK_HASHES["ModelSubsetGeomData"])
     added_hashes = [
         block_hash for block_hash in replacements
         if block_hash not in physical_hashes and block_hash not in remove_hashes and block_hash != geom_hash
     ]
-    if geom_hash in physical_hashes:
+    if geom_hash in physical_hashes and bulk_at_end:
         physical_hashes = [h for h in physical_hashes if h != geom_hash] + sorted(added_hashes) + [geom_hash]
     else:
         physical_hashes.extend(sorted(added_hashes))
@@ -2586,14 +4462,23 @@ def _rebuild_dat1(template, replacements, string_pool, remove_hashes=None):
             payload = template.payload(block_hash)
         if string_delta:
             payload = _relocate_model_string_offsets(block_hash, payload, string_delta)
-        if block_hash == geom_hash:
-            original_geom_offset, original_geom_size = template.blocks[geom_hash]
+        if block_hash == geom_hash and pad_bulk_block:
+            _original_geom_offset, original_geom_size = template.blocks[geom_hash]
             if len(payload) < original_geom_size:
                 payload += b"\x00" * (original_geom_size - len(payload))
-        alignment = _block_alignment(block_hash)
+        alignment = (
+            max(1, int(alignment_override))
+            if alignment_override is not None
+            else _block_alignment(block_hash)
+        )
         aligned = _align(cursor, alignment)
-        if block_hash == geom_hash and aligned <= original_geom_offset:
-            aligned = original_geom_offset
+        original_block_offset = int(template.blocks.get(block_hash, (0, 0))[0])
+        if (
+            original_block_offset
+            and aligned <= original_block_offset
+            and (preserve_original_offsets or block_hash == geom_hash)
+        ):
+            aligned = original_block_offset
         pad = aligned - cursor
         if pad:
             body += b"\x00" * pad
@@ -2616,7 +4501,13 @@ def _rebuild_dat1(template, replacements, string_pool, remove_hashes=None):
     declared_size = DAT1_HEADER_SIZE + len(block_table) + len(template.fixup_table) + len(header_padding) + len(strings) + len(body)
     header = struct.pack("<IIIHH", DAT1_FILE_ID, template.version, declared_size, len(payload_by_hash), template.fixup_count)
     out = header + block_table + template.fixup_table + header_padding + strings + bytes(body)
-    return out, offset_by_hash.get(geom_hash, 0), len(payload_by_hash.get(geom_hash, b""))
+    bulk_offset = offset_by_hash.get(geom_hash, 0)
+    bulk_size = (
+        len(out) - bulk_offset
+        if bulk_offset and not bulk_at_end
+        else len(payload_by_hash.get(geom_hash, b""))
+    )
+    return out, bulk_offset, bulk_size
 
 
 def _asset_chunk_info(size):
@@ -2644,6 +4535,19 @@ def _build_stg_header(version, topology_size, bulk_size):
     stg += serialized_header
     _align_buffer(stg, STG_HEADER_ALIGN)
     return bytes(stg)
+
+
+def _build_msmr_model_header(template, bulk_offset, bulk_size):
+    header = bytearray(template.prefix if len(template.prefix) == 36 else b"\x00" * 36)
+    struct.pack_into(
+        "<III",
+        header,
+        0,
+        MSMR_MODEL_MAGIC,
+        int(bulk_offset),
+        int(bulk_size),
+    )
+    return bytes(header)
 
 
 def _expected_original_model_name(arm):
@@ -2716,13 +4620,21 @@ class MODEL_OT_select_original_model_for_export(Operator, ImportHelper):
 
         arm["engine_model_source_path"] = source_path
         arm["engine_model_source_had_stg"] = bool(template.had_stg)
-        source_has_morphs = BLOCK_HASHES["ModelAnimMorph2Info"] in template.blocks
+        source_has_morphs = (
+            MSMR_MODEL_ANIM_MORPH_INFO_HASH in template.blocks
+            if is_msmr_model(template.blocks)
+            else BLOCK_HASHES["ModelAnimMorph2Info"] in template.blocks
+        )
         source_has_ziva = BLOCK_HASHES["ModelAnimZiva2Info"] in template.blocks
         arm["engine_model_source_has_morphs"] = source_has_morphs
         arm["engine_model_source_has_ziva"] = source_has_ziva
         if source_has_morphs:
             try:
-                source_morph = decode_model_morph2(template.data, template.blocks)
+                source_morph = (
+                    decode_msmr_morphs(template.data, template.blocks)
+                    if is_msmr_model(template.blocks)
+                    else decode_model_morph2(template.data, template.blocks)
+                )
                 arm["engine_model_morph_target_count"] = int(
                     len((source_morph or {}).get("targets", []))
                 )
@@ -2806,17 +4718,27 @@ class ExportEngineModel(Operator, ExportHelper):
             )
             return {'CANCELLED'}
 
-        source_has_morph = BLOCK_HASHES["ModelAnimMorph2Info"] in template.blocks
-        source_has_ziva = BLOCK_HASHES["ModelAnimZiva2Info"] in template.blocks
+        msmr = is_msmr_model(template.blocks)
+        source_has_morph = (
+            MSMR_MODEL_ANIM_MORPH_INFO_HASH in template.blocks
+            if msmr
+            else BLOCK_HASHES["ModelAnimMorph2Info"] in template.blocks
+        )
+        source_has_ziva = not msmr and BLOCK_HASHES["ModelAnimZiva2Info"] in template.blocks
         source_has_smooth = BLOCK_HASHES["ModelAnimVertSmoothInfo"] in template.blocks
         discard_unimported_morphs = bool(getattr(arm, "engine_model_discard_unimported_morphs", False))
         recover_source_morph = (
             source_has_morph
+            and not msmr
             and not bool(arm.get("engine_model_shape_keys_imported", False))
             and not discard_unimported_morphs
         )
 
-        required = ("ModelBuilt", "ModelMaterial", "ModelLook", "ModelLookGroup", "ModelLookBuilt", "ModelSubset", "ModelSubsetGeomData")
+        required = (
+            ("ModelBuilt", "ModelMaterial", "ModelLook", "ModelLookGroup", "ModelLookBuilt", "ModelSubset", "ModelIndex", "ModelStdVert")
+            if msmr
+            else ("ModelBuilt", "ModelMaterial", "ModelLook", "ModelLookGroup", "ModelLookBuilt", "ModelSubset", "ModelSubsetGeomData")
+        )
         missing = [name for name in required if BLOCK_HASHES[name] not in template.blocks]
         if missing:
             self.report(
@@ -2832,7 +4754,14 @@ class ExportEngineModel(Operator, ExportHelper):
             and obj.get("engine_bounds_type", "") != "subset_aabb"
         ]
         resolve_subset_index_collisions(arm)
-        sanitize_model_look_metadata(arm, mark_modified=True)
+        # A LOD0-only import intentionally has no Blender objects for lower
+        # source LODs. Do not treat their look subset IDs as stale unless the
+        # user has explicitly switched to editing the look definitions.
+        if (
+            bool(arm.get("engine_model_import_all_lods", False))
+            or bool(arm.get("engine_model_looks_modified", False))
+        ):
+            sanitize_model_look_metadata(arm, mark_modified=True)
 
         def subset_sort_key(obj):
             value = obj.get("engine_subset_index", None)
@@ -2846,6 +4775,196 @@ class ExportEngineModel(Operator, ExportHelper):
                 "to the Armature, then export again.",
             )
             return {'CANCELLED'}
+
+        if msmr:
+            wm = context.window_manager
+            wm.progress_begin(0, 100)
+            export_warnings = []
+            try:
+                wm.progress_update(10)
+                original_materials = _parse_model_materials(template.data, template.blocks)
+                material_entries, material_indices = _build_material_entries(
+                    mesh_objects,
+                    original_materials,
+                    export_warnings,
+                )
+                string_pool = _StringPool(template.sb_offset, template.string_buffer)
+                hierarchy_hash = BLOCK_HASHES["ModelJointHierarchy"]
+                if hierarchy_hash in template.blocks:
+                    hierarchy = template.payload(hierarchy_hash)
+                    source_joint_count = struct.unpack_from("<H", hierarchy, 2)[0] if len(hierarchy) >= 4 else 0
+                else:
+                    source_joint_count = 0
+
+                source_morph_targets_by_subset = {}
+                recover_msmr_morphs = (
+                    source_has_morph
+                    and not bool(arm.get("engine_model_shape_keys_imported", False))
+                    and not discard_unimported_morphs
+                )
+                if recover_msmr_morphs:
+                    source_morph = decode_msmr_morphs(template.data, template.blocks)
+                    for target_index, target in enumerate((source_morph or {}).get("targets", [])):
+                        for subset in target.get("subsets", []):
+                            source_morph_targets_by_subset.setdefault(
+                                int(subset.get("subset_index", -1)),
+                                [],
+                            ).append({
+                                "name": str(target.get("name", f"Morph_{target_index}")),
+                                "hash": int(target.get("hash", 0)) & U32_MASK,
+                                "source_index": int(target.get("index", target_index)),
+                                "deltas": dict(subset.get("deltas", {})),
+                            })
+
+                wm.progress_update(30)
+                geometry = _build_msmr_geometry_blocks(
+                    mesh_objects,
+                    arm,
+                    material_indices,
+                    template,
+                    source_joint_count,
+                    export_warnings=export_warnings,
+                    source_morph_targets_by_subset=source_morph_targets_by_subset,
+                )
+                replacements = dict(geometry["replacements"])
+                replacements[BLOCK_HASHES["ModelMaterial"]] = _build_material_block(
+                    material_entries,
+                    string_pool,
+                )
+                source_subset_count = (
+                    len(template.payload(BLOCK_HASHES["ModelSubset"]))
+                    // MSMR_SUBSET_RECORD_SIZE
+                )
+                source_subset_layout_preserved = (
+                    bool(geometry.get("source_subset_layout_preserved", False))
+                    or (
+                        len(geometry["stats"]) == source_subset_count
+                        and all(
+                            int(stat.get("source_subset_index", -1)) == subset_index
+                            for subset_index, stat in enumerate(geometry["stats"])
+                        )
+                    )
+                )
+                looks_modified = bool(arm.get("engine_model_looks_modified", False))
+                stale_lod0_look_edit = (
+                    looks_modified
+                    and not bool(arm.get("engine_model_import_all_lods", False))
+                    and _msmr_lod0_scene_looks_match_source(arm, template)
+                )
+                preserve_msmr_looks = (
+                    source_subset_layout_preserved
+                    and (not looks_modified or stale_lod0_look_edit)
+                )
+                if preserve_msmr_looks:
+                    look_block = template.payload(BLOCK_HASHES["ModelLook"])
+                    look_built_block = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+                    look_group_block = template.payload(BLOCK_HASHES["ModelLookGroup"])
+                else:
+                    look_block, look_built_block, look_group_block = _build_msmr_look_blocks(
+                        len(geometry["stats"]),
+                        string_pool,
+                        template,
+                        arm,
+                        geometry["subset_index_map"],
+                    )
+                replacements[BLOCK_HASHES["ModelLook"]] = look_block
+                replacements[BLOCK_HASHES["ModelLookBuilt"]] = look_built_block
+                replacements[BLOCK_HASHES["ModelLookGroup"]] = look_group_block
+                replacements[BLOCK_HASHES["ModelBuilt"]] = _build_msmr_model_built_block(
+                    template,
+                    geometry,
+                )
+
+                remove_hashes = set()
+                morph_count = 0
+                if source_has_morph and bool(geometry.get("preserve_source_morphs", False)):
+                    replacements.update({
+                        MSMR_MODEL_ANIM_MORPH_INFO_HASH: template.payload(MSMR_MODEL_ANIM_MORPH_INFO_HASH),
+                        MSMR_MODEL_ANIM_MORPH_DATA_HASH: template.payload(MSMR_MODEL_ANIM_MORPH_DATA_HASH),
+                        MSMR_MODEL_ANIM_MORPH_INDICES_HASH: template.payload(MSMR_MODEL_ANIM_MORPH_INDICES_HASH),
+                    })
+                    source_morph = decode_msmr_morphs(template.data, template.blocks)
+                    morph_count = int((source_morph or {}).get("target_count", 0))
+                elif source_has_morph and (
+                    bool(arm.get("engine_model_shape_keys_imported", False))
+                    or recover_msmr_morphs
+                ):
+                    morph_result = _build_msmr_morph_blocks(
+                        template,
+                        geometry["morph_targets"],
+                        string_pool,
+                    )
+                    if morph_result is not None:
+                        morph_replacements, morph_count = morph_result
+                        replacements.update(morph_replacements)
+                elif source_has_morph and discard_unimported_morphs:
+                    remove_hashes.update({
+                        MSMR_MODEL_ANIM_MORPH_INFO_HASH,
+                        MSMR_MODEL_ANIM_MORPH_DATA_HASH,
+                        MSMR_MODEL_ANIM_MORPH_INDICES_HASH,
+                    })
+                    export_warnings.append(
+                        "Facial animation was left out because 'Discard Unimported Morphs' is turned on."
+                    )
+
+                preserve_msmr_bvh = (
+                    preserve_msmr_looks
+                    and bool(geometry.get("source_geometry_unchanged", False))
+                )
+                bvh_hash = BLOCK_HASHES.get("ModelLookBVHInfo")
+                if bvh_hash in template.blocks and not preserve_msmr_bvh:
+                    replacements[bvh_hash] = b"\x00" * template.blocks[bvh_hash][1]
+
+                wm.progress_update(75)
+                dat1, bulk_offset, bulk_size = _rebuild_dat1(
+                    template,
+                    replacements,
+                    string_pool,
+                    remove_hashes=remove_hashes,
+                    bulk_hash=MSMR_MODEL_INDEX_HASH,
+                    bulk_at_end=False,
+                    pad_bulk_block=False,
+                    alignment_override=DAT1_BLOCK_ALIGN,
+                    preserve_original_offsets=True,
+                )
+                stg_mode = str(getattr(self, "stg_mode", "SCENE") or "SCENE")
+                source_had_wrapper = len(template.prefix) == 36
+                if stg_mode == "STG":
+                    add_wrapper = True
+                elif stg_mode == "RAW":
+                    add_wrapper = False
+                else:
+                    # AUTO and the file-menu default both preserve MSMR's native
+                    # wrapper. The scene's STG checkbox belongs to MSM2 and must
+                    # not silently turn an MSMR .model into raw DAT1.
+                    add_wrapper = source_had_wrapper
+                if add_wrapper:
+                    out = _build_msmr_model_header(template, bulk_offset, bulk_size) + dat1
+                    format_name = "MSMR model wrapper+DAT1"
+                else:
+                    out = dat1
+                    format_name = "raw DAT1"
+                with open(self.filepath, "wb") as file:
+                    file.write(out)
+            except Exception as exc:
+                log_exception("MSMR model export failed")
+                wm.progress_end()
+                self.report({'ERROR'}, f"Export couldn't finish. {_friendly_export_error(exc)}")
+                return {'CANCELLED'}
+
+            wm.progress_update(100)
+            wm.progress_end()
+            if export_warnings:
+                for warning in export_warnings:
+                    log_warning("MSMR model export check: %s", warning)
+                self.report({'WARNING'}, _format_export_warnings(export_warnings))
+            self.report(
+                {'INFO'},
+                f"Export finished ({format_name}): {len(geometry['stats'])} mesh part(s), "
+                f"{geometry['vertex_count']} vertices, {geometry['index_count'] // 3} triangles, and "
+                f"{morph_count} facial shape(s).",
+            )
+            return {'FINISHED'}
 
         wm = context.window_manager
         wm.progress_begin(0, 100)
@@ -2872,7 +4991,7 @@ class ExportEngineModel(Operator, ExportHelper):
                     )
                 except ValueError as exc:
                     raise ValueError(
-                        f"{exc} If you do not need facial animation, turn on 'Discard Unimported Morph2' "
+                        f"{exc} If you do not need facial animation, turn on 'Discard Unimported Morphs' "
                         "under Model > Export and try again."
                     ) from exc
                 log_debug(
@@ -2886,7 +5005,7 @@ class ExportEngineModel(Operator, ExportHelper):
                     )
             elif source_has_morph and discard_unimported_morphs:
                 export_warnings.append(
-                    "Facial animation was left out because 'Discard Unimported Morph2' is turned on. Turn it "
+                    "Facial animation was left out because 'Discard Unimported Morphs' is turned on. Turn it "
                     "off and re-import with Import Shape Keys enabled if you want facial animation."
                 )
 
@@ -2915,7 +5034,6 @@ class ExportEngineModel(Operator, ExportHelper):
                 arm=arm,
                 subset_index_map=subset_index_map,
             )
-# i dont think this works
             has_smooth = bool(has_morph and source_has_smooth and not source_has_ziva)
             model_built_block = _build_model_built_block(
                 template,
