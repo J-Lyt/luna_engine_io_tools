@@ -2767,6 +2767,18 @@ def _msmr_hybrid_morph_targets(
     return targets
 
 
+def _msmr_lod0_subset_ids(template):
+    look = template.payload(BLOCK_HASHES["ModelLook"])
+    if len(look) % 32:
+        raise ValueError("The original MSMR Model Look block is truncated")
+    return sorted({
+        subset_index
+        for record_offset in range(0, len(look), 32)
+        for start, count in (struct.unpack_from("<HH", look, record_offset),)
+        for subset_index in range(int(start), int(start) + int(count))
+    })
+
+
 def _build_msmr_geometry_blocks(
     mesh_objects,
     arm,
@@ -2775,6 +2787,7 @@ def _build_msmr_geometry_blocks(
     source_joint_count,
     export_warnings=None,
     source_morph_targets_by_subset=None,
+    compact_lod0=False,
 ):
     original_subset_block = template.payload(BLOCK_HASHES["ModelSubset"])
     original_count = len(original_subset_block) // MSMR_SUBSET_RECORD_SIZE
@@ -2922,8 +2935,17 @@ def _build_msmr_geometry_blocks(
         int(stat.get("source_subset_index", -1))
         for stat in stats
     ]
+    if compact_lod0:
+        expected_lod0_subset_ids = _msmr_lod0_subset_ids(template)
+        if imported_source_indices != expected_lod0_subset_ids:
+            raise ValueError(
+                "Compact LOD0 export needs every source LOD0 subset exactly once. "
+                "Re-import the model without 'Import All LODs', keep every imported mesh parented to its "
+                "armature, then export again."
+            )
     preserve_source_vertex_layout = (
-        len(imported_source_indices) <= original_count
+        not compact_lod0
+        and len(imported_source_indices) <= original_count
         and len(set(imported_source_indices)) == len(imported_source_indices)
         and all(0 <= subset_index < original_count for subset_index in imported_source_indices)
         and all(topology is not None for topology in source_slot_topologies)
@@ -3020,7 +3042,8 @@ def _build_msmr_geometry_blocks(
     # skin batches. This avoids rebuilding or renumbering otherwise untouched
     # LOD geometry merely because one visible subset was replaced or joined.
     preserve_source_subset_layout = (
-        len(imported_source_indices) <= original_count
+        not compact_lod0
+        and len(imported_source_indices) <= original_count
         and len(set(imported_source_indices)) == len(imported_source_indices)
         and all(0 <= subset_index < original_count for subset_index in imported_source_indices)
         and any(
@@ -3405,8 +3428,24 @@ def _build_msmr_geometry_blocks(
     source_uv_logs = struct.unpack_from("<I", built, 48)[0] if len(built) >= 52 else 0
     uv_log = max(source_uv_logs & 0xF, _uv_log_for_values(all_vertices, "uv0"))
 
-    values = np.empty((6, len(all_vertices)), dtype=np.int16)
-    normal_words = np.empty(len(all_vertices), dtype=np.uint32)
+    live_vertex_count = len(all_vertices)
+    live_index_count = len(all_indices)
+    output_vertex_count = (
+        max(live_vertex_count, len(source_geometry["positions"]))
+        if compact_lod0
+        else live_vertex_count
+    )
+    output_index_count = (
+        max(live_index_count, len(source_geometry["indices"]))
+        if compact_lod0
+        else live_index_count
+    )
+    output_indices = list(all_indices)
+    if len(output_indices) < output_index_count:
+        output_indices.extend([0] * (output_index_count - len(output_indices)))
+
+    values = np.zeros((6, output_vertex_count), dtype=np.int16)
+    normal_words = np.zeros(output_vertex_count, dtype=np.uint32)
     for vertex_index, vertex in enumerate(all_vertices):
         co = vertex["co"]
         values[0:3, vertex_index] = [
@@ -3417,9 +3456,19 @@ def _build_msmr_geometry_blocks(
         values[4:6, vertex_index] = _pack_uv(vertex.get("uv0", (0.0, 0.0)), uv_log)
         normal_words[vertex_index] = int(vertex["normal_tangent"]) & U32_MASK
 
+    subset_payload = b"".join(bytes(record) for record in subset_records)
+    if compact_lod0:
+        subset_payload = subset_payload.ljust(len(original_subset_block), b"\x00")
+
+    def capacity_padded(payload, block_hash):
+        if not compact_lod0:
+            return payload
+        source_size = int(template.blocks.get(block_hash, (0, 0))[1])
+        return payload.ljust(max(len(payload), source_size), b"\x00")
+
     replacements = {
-        BLOCK_HASHES["ModelSubset"]: b"".join(bytes(record) for record in subset_records),
-        MSMR_MODEL_INDEX_HASH: encode_msmr_index_stream(all_indices),
+        BLOCK_HASHES["ModelSubset"]: subset_payload,
+        MSMR_MODEL_INDEX_HASH: encode_msmr_index_stream(output_indices),
         MSMR_MODEL_STD_VERT_HASH: encode_msmr_vertex_stream(normal_words, values),
     }
     if skin_data or skin_batches:
@@ -3430,17 +3479,32 @@ def _build_msmr_geometry_blocks(
             raise ValueError(
                 "The original MSMR model has no skin streams, so weighted meshes cannot be added to it"
             )
-        replacements[MSMR_MODEL_SKIN_DATA_HASH] = skin_data
-        replacements[MSMR_MODEL_SKIN_BATCH_HASH] = skin_batches
+        replacements[MSMR_MODEL_SKIN_DATA_HASH] = capacity_padded(
+            skin_data,
+            MSMR_MODEL_SKIN_DATA_HASH,
+        )
+        replacements[MSMR_MODEL_SKIN_BATCH_HASH] = capacity_padded(
+            skin_batches,
+            MSMR_MODEL_SKIN_BATCH_HASH,
+        )
     else:
         if MSMR_MODEL_SKIN_DATA_HASH in template.blocks:
-            replacements[MSMR_MODEL_SKIN_DATA_HASH] = b""
+            replacements[MSMR_MODEL_SKIN_DATA_HASH] = capacity_padded(
+                b"",
+                MSMR_MODEL_SKIN_DATA_HASH,
+            )
         if MSMR_MODEL_SKIN_BATCH_HASH in template.blocks:
-            replacements[MSMR_MODEL_SKIN_BATCH_HASH] = b""
+            replacements[MSMR_MODEL_SKIN_BATCH_HASH] = capacity_padded(
+                b"",
+                MSMR_MODEL_SKIN_BATCH_HASH,
+            )
     if MSMR_MODEL_SKIN_JOINT_REMAP_HASH in template.blocks:
-        replacements[MSMR_MODEL_SKIN_JOINT_REMAP_HASH] = joint_remaps
+        replacements[MSMR_MODEL_SKIN_JOINT_REMAP_HASH] = capacity_padded(
+            joint_remaps,
+            MSMR_MODEL_SKIN_JOINT_REMAP_HASH,
+        )
     if MSMR_MODEL_UV1_VERT_HASH in template.blocks:
-        uv1_values = np.empty((len(all_vertices), 2), dtype="<i2")
+        uv1_values = np.zeros((output_vertex_count, 2), dtype="<i2")
         for vertex_index, vertex in enumerate(all_vertices):
             uv1 = vertex.get("uv1") or (0.0, 0.0)
             uv1_values[vertex_index] = (
@@ -3449,10 +3513,13 @@ def _build_msmr_geometry_blocks(
             )
         replacements[MSMR_MODEL_UV1_VERT_HASH] = uv1_values.tobytes()
     if MSMR_MODEL_COL_VERT_HASH in template.blocks:
-        replacements[MSMR_MODEL_COL_VERT_HASH] = np.asarray(color_words, dtype="<u4").tobytes()
+        output_colors = np.zeros(output_vertex_count, dtype="<u4")
+        output_colors[:len(color_words)] = np.asarray(color_words, dtype="<u4")
+        replacements[MSMR_MODEL_COL_VERT_HASH] = output_colors.tobytes()
 
     source_geometry_unchanged = (
-        replacements[MSMR_MODEL_INDEX_HASH] == template.payload(MSMR_MODEL_INDEX_HASH)
+        not compact_lod0
+        and replacements[MSMR_MODEL_INDEX_HASH] == template.payload(MSMR_MODEL_INDEX_HASH)
         and replacements[MSMR_MODEL_STD_VERT_HASH] == template.payload(MSMR_MODEL_STD_VERT_HASH)
     )
 
@@ -3464,9 +3531,13 @@ def _build_msmr_geometry_blocks(
         "position_offset": position_offset,
         "position_scale": position_scale,
         "uv_logs": (source_uv_logs & ~0xF) | uv_log,
-        "vertex_count": len(all_vertices),
-        "index_count": len(all_indices),
+        "vertex_count": output_vertex_count,
+        "index_count": output_index_count,
+        "live_vertex_count": live_vertex_count,
+        "live_index_count": live_index_count,
+        "compact_lod0": bool(compact_lod0),
         "source_geometry_unchanged": source_geometry_unchanged,
+        "source_subset_layout_preserved": False,
     }
 
 
@@ -3594,6 +3665,21 @@ def _build_msmr_look_blocks(subset_count, string_pool, template, arm, subset_ind
 
     look_group = _build_look_group_block(groups, len(look_defs), string_pool)
     return bytes(look_block), bytes(headers + data), look_group
+
+
+def _build_msmr_compact_lod0_look_block(template):
+    """Use each source look's LOD0 subset range at every populated MSMR LOD."""
+    original = template.payload(BLOCK_HASHES["ModelLook"])
+    if len(original) % 32:
+        raise ValueError("The original MSMR Model Look block is truncated")
+    compact = bytearray(original)
+    for record_offset in range(0, len(compact), 32):
+        lod0 = bytes(compact[record_offset:record_offset + 4])
+        for lod_index in range(1, 6):
+            compact[
+                record_offset + lod_index * 4:record_offset + (lod_index + 1) * 4
+            ] = lod0
+    return bytes(compact)
 
 
 def _build_msmr_model_built_block(template, geometry):
@@ -4727,6 +4813,11 @@ class ExportEngineModel(Operator, ExportHelper):
         source_has_ziva = not msmr and BLOCK_HASHES["ModelAnimZiva2Info"] in template.blocks
         source_has_smooth = BLOCK_HASHES["ModelAnimVertSmoothInfo"] in template.blocks
         discard_unimported_morphs = bool(getattr(arm, "engine_model_discard_unimported_morphs", False))
+        compact_lod0 = bool(
+            msmr
+            and getattr(arm, "engine_model_compact_lod0_export", False)
+            and not bool(arm.get("engine_model_import_all_lods", False))
+        )
         recover_source_morph = (
             source_has_morph
             and not msmr
@@ -4825,6 +4916,7 @@ class ExportEngineModel(Operator, ExportHelper):
                     source_joint_count,
                     export_warnings=export_warnings,
                     source_morph_targets_by_subset=source_morph_targets_by_subset,
+                    compact_lod0=compact_lod0,
                 )
                 replacements = dict(geometry["replacements"])
                 replacements[BLOCK_HASHES["ModelMaterial"]] = _build_material_block(
@@ -4855,7 +4947,11 @@ class ExportEngineModel(Operator, ExportHelper):
                     source_subset_layout_preserved
                     and (not looks_modified or stale_lod0_look_edit)
                 )
-                if preserve_msmr_looks:
+                if compact_lod0:
+                    look_block = _build_msmr_compact_lod0_look_block(template)
+                    look_built_block = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+                    look_group_block = template.payload(BLOCK_HASHES["ModelLookGroup"])
+                elif preserve_msmr_looks:
                     look_block = template.payload(BLOCK_HASHES["ModelLook"])
                     look_built_block = template.payload(BLOCK_HASHES["ModelLookBuilt"])
                     look_group_block = template.payload(BLOCK_HASHES["ModelLookGroup"])
@@ -4961,7 +5057,8 @@ class ExportEngineModel(Operator, ExportHelper):
             self.report(
                 {'INFO'},
                 f"Export finished ({format_name}): {len(geometry['stats'])} mesh part(s), "
-                f"{geometry['vertex_count']} vertices, {geometry['index_count'] // 3} triangles, and "
+                f"{geometry.get('live_vertex_count', geometry['vertex_count'])} vertices, "
+                f"{geometry.get('live_index_count', geometry['index_count']) // 3} triangles, and "
                 f"{morph_count} facial shape(s).",
             )
             return {'FINISHED'}

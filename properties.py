@@ -635,6 +635,14 @@ def register_properties():
         description="Deliberately remove source morph data when it was not imported as shape keys",
         default=False,
     )
+    bpy.types.Object.engine_model_compact_lod0_export = BoolProperty(
+        name="Compact LOD0 Only",
+        description=(
+            "Rebuild only the imported MSMR LOD0 subsets and use them at every game LOD distance; "
+            "lower-detail source LOD geometry will not be included"
+        ),
+        default=False,
+    )
     bpy.types.Object.engine_ziva_active_channel = EnumProperty(
         name="Ziva Channel",
         description="Named compiled Ziva channel to transfer into editable Morph2 shape keys",
@@ -776,6 +784,7 @@ def unregister_properties():
         (bpy.types.Object, "engine_ziva_overwrite_targets"),
         (bpy.types.Object, "engine_ziva_transfer_distance"),
         (bpy.types.Object, "engine_ziva_active_channel"),
+        (bpy.types.Object, "engine_model_compact_lod0_export"),
         (bpy.types.Object, "engine_model_discard_unimported_morphs"),
         (bpy.types.Object, "engine_model_show_look_groups"),
         (bpy.types.Object, "engine_model_show_dat1"),
