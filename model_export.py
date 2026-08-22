@@ -1031,6 +1031,15 @@ def _prefetch_loop_uvs(layer, loop_count):
     return list(zip(flat[0::2].tolist(), (1.0 - flat[1::2]).tolist()))
 
 
+def _uv_nearly_equal(left, right, threshold=0.0001):
+    if left is None or right is None:
+        return left is None and right is None
+    return (
+        abs(float(left[0]) - float(right[0])) <= threshold
+        and abs(float(left[1]) - float(right[1])) <= threshold
+    )
+
+
 def _prefetch_engine_positions(mesh, matrix, basis_coords, vertex_count):
     if _matrix_is_identity_4x4(matrix):
         if basis_coords is not None:
@@ -2765,15 +2774,17 @@ def _msmr_source_slot_topology(obj, arm, source_geometry, source_subset):
         return None
 
     mesh.calc_loop_triangles()
+    uv0_values = _prefetch_loop_uvs(uv0_layer, len(mesh.loops))
     remapped_indices = []
     for triangle in mesh.loop_triangles:
         for loop_index in triangle.loops:
-            vertex_index = int(mesh.loops[int(loop_index)].vertex_index)
+            loop_index = int(loop_index)
+            vertex_index = int(mesh.loops[loop_index].vertex_index)
             source_uv = (
                 float(attributes["engine_source_uv0_u"][vertex_index].value),
                 float(attributes["engine_source_uv0_v"][vertex_index].value),
             )
-            if not _uv_nearly_equal(_loop_uv(uv0_layer, int(loop_index)), source_uv, threshold=1.0e-7):
+            if not _uv_nearly_equal(uv0_values[loop_index], source_uv, threshold=1.0e-7):
                 return None
             remapped_indices.append(slot_map[vertex_index])
     if not remapped_indices or len(remapped_indices) > int(source_subset["index_count"]):
