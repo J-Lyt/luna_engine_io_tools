@@ -68,6 +68,8 @@ from .model_import import (
 DAT1_BLOCK_ALIGN = 16
 DAT1_CACHELINE_ALIGN = 64
 MSMR_SKIN_BATCH_MAX_VERTEX_COUNT = 2560
+MSMR_LOOK_LOD_COUNT = 6
+MSMR_LOOK_BUILT_LOD_MASK_SIZE = 256
 STG_MAGIC = 0x00475453
 STG_VERSION = 0x1
 STG_HEADER_ALIGN = 16
@@ -2996,6 +2998,25 @@ def _msmr_lod0_subset_ids(template):
     })
 
 
+def _msmr_compact_lod_subset_bases(template, lod0_subset_count):
+    """Return a distinct cloned-subset base for every populated MSMR LOD."""
+    look = template.payload(BLOCK_HASHES["ModelLook"])
+    if len(look) % 32:
+        raise ValueError("The original MSMR Model Look block is truncated")
+    lod0_subset_count = int(lod0_subset_count)
+    bases = [0]
+    next_base = lod0_subset_count
+    for lod_index in range(1, MSMR_LOOK_LOD_COUNT):
+        populated = any(
+            struct.unpack_from("<H", look, record_offset + lod_index * 4 + 2)[0]
+            for record_offset in range(0, len(look), 32)
+        )
+        bases.append(next_base if populated else None)
+        if populated:
+            next_base += lod0_subset_count
+    return tuple(bases)
+
+
 def _build_msmr_geometry_blocks(
     mesh_objects,
     arm,
@@ -3675,6 +3696,8 @@ def _build_msmr_geometry_blocks(
 
     subset_payload = b"".join(bytes(record) for record in subset_records)
     if compact_lod0:
+        lod_bases = _msmr_compact_lod_subset_bases(template, len(subset_records))
+        subset_payload *= sum(base is not None for base in lod_bases)
         subset_payload = subset_payload.ljust(len(original_subset_block), b"\x00")
 
     def capacity_padded(payload, block_hash):
@@ -3884,18 +3907,80 @@ def _build_msmr_look_blocks(subset_count, string_pool, template, arm, subset_ind
     return bytes(look_block), bytes(headers + data), look_group
 
 
-def _build_msmr_compact_lod0_look_block(template):
-    """Use each source look's LOD0 subset range at every populated MSMR LOD."""
+def _build_msmr_compact_lod0_look_block(template, lod0_subset_count):
+    """Map each populated MSMR LOD to a distinct clone of its LOD0 subsets."""
     original = template.payload(BLOCK_HASHES["ModelLook"])
     if len(original) % 32:
         raise ValueError("The original MSMR Model Look block is truncated")
+    lod_bases = _msmr_compact_lod_subset_bases(template, lod0_subset_count)
     compact = bytearray(original)
     for record_offset in range(0, len(compact), 32):
-        lod0 = bytes(compact[record_offset:record_offset + 4])
-        for lod_index in range(1, 6):
-            compact[
-                record_offset + lod_index * 4:record_offset + (lod_index + 1) * 4
-            ] = lod0
+        lod0_start, lod0_count = struct.unpack_from("<HH", original, record_offset)
+        for lod_index in range(1, MSMR_LOOK_LOD_COUNT):
+            _start, count = struct.unpack_from(
+                "<HH", original, record_offset + lod_index * 4
+            )
+            if not count:
+                continue
+            mapped_start = int(lod_bases[lod_index]) + int(lod0_start)
+            if mapped_start > 0xFFFF or int(lod0_count) > 0xFFFF:
+                raise ValueError("Compact MSMR LOD subset indexes exceed the format limit")
+            struct.pack_into(
+                "<HH",
+                compact,
+                record_offset + lod_index * 4,
+                mapped_start,
+                lod0_count,
+            )
+    return bytes(compact)
+
+
+def _build_msmr_compact_lod0_look_built_block(template, look):
+    """Build compiled subset masks for the cloned compact LOD ranges."""
+    original = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+    if len(look) % 32:
+        raise ValueError("The original MSMR Model Look block is truncated")
+    look_count = len(look) // 32
+    headers_size = look_count * MODEL_LOOK_BUILT_SIZE
+    if len(original) < headers_size:
+        raise ValueError("The original MSMR Model Look Built block is truncated")
+
+    headers = []
+    section_offsets = set()
+    for look_index in range(look_count):
+        header_offset = look_index * MODEL_LOOK_BUILT_SIZE
+        offsets = tuple(struct.unpack_from("<7Q", original, header_offset))
+        headers.append(offsets)
+        section_offsets.update(
+            int(offset) for offset in offsets if 0 <= int(offset) <= len(original)
+        )
+
+    expected_mask_size = MSMR_LOOK_LOD_COUNT * MSMR_LOOK_BUILT_LOD_MASK_SIZE
+    compact = bytearray(original)
+    for look_index, offsets in enumerate(headers):
+        masks_start = int(offsets[6])
+        following_offsets = [
+            offset for offset in section_offsets if masks_start < offset <= len(original)
+        ]
+        masks_end = min(following_offsets, default=len(original))
+        if masks_start < headers_size or masks_end - masks_start != expected_mask_size:
+            raise ValueError(
+                "The original MSMR Model Look Built block has an unsupported LOD mask layout"
+            )
+
+        look_offset = look_index * 32
+        for lod_index in range(MSMR_LOOK_LOD_COUNT):
+            start, count = struct.unpack_from(
+                "<HH", look, look_offset + lod_index * 4
+            )
+            if int(start) + int(count) > MSMR_LOOK_BUILT_LOD_MASK_SIZE * 8:
+                raise ValueError("Compact MSMR LOD subset indexes exceed the look-mask limit")
+            lod_mask = bytearray(MSMR_LOOK_BUILT_LOD_MASK_SIZE)
+            for subset_index in range(int(start), int(start) + int(count)):
+                lod_mask[subset_index // 8] |= 1 << (subset_index & 7)
+            mask_start = masks_start + lod_index * MSMR_LOOK_BUILT_LOD_MASK_SIZE
+            compact[mask_start:mask_start + MSMR_LOOK_BUILT_LOD_MASK_SIZE] = lod_mask
+
     return bytes(compact)
 
 
@@ -5170,8 +5255,14 @@ class ExportEngineModel(Operator, ExportHelper):
                     and (not looks_modified or stale_lod0_look_edit)
                 )
                 if compact_lod0:
-                    look_block = _build_msmr_compact_lod0_look_block(template)
-                    look_built_block = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+                    look_block = _build_msmr_compact_lod0_look_block(
+                        template,
+                        len(geometry["stats"]),
+                    )
+                    look_built_block = _build_msmr_compact_lod0_look_built_block(
+                        template,
+                        look_block,
+                    )
                     look_group_block = template.payload(BLOCK_HASHES["ModelLookGroup"])
                 elif preserve_msmr_looks:
                     look_block = template.payload(BLOCK_HASHES["ModelLook"])
