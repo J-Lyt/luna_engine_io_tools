@@ -47,7 +47,13 @@ MODEL_SUBSET_LOD_MASK_OFFSET = 102
 MODEL_SUBSET_ORIGIN_OFFSET = 48
 MODEL_VERTEX_SIZE = 16
 MODEL_SUBSET_HAS_ORIGIN = 0x4000
-SUBSET_CENTER_LOG_SCALE = 4
+# NOTE: was previously named SUBSET_CENTER_LOG_SCALE, which collided with the
+# unrelated constant of the same name in constants.py/model_export.py (=8).
+# registration._wire_module_globals() merges all module-level names into a
+# single shared namespace, so that collision silently overwrote this value
+# with 8 at addon-load time, making Ziva base-position decoding 16x too large.
+# Renamed to keep it out of the shared-name collision entirely.
+ZIVA_BASE_POSITION_LOG_SCALE = 4
 
 _FORMAT_DTYPES = {
     41: np.dtype("<f4"),  # DXGI_FORMAT_R32_FLOAT
@@ -589,7 +595,7 @@ class ZivaModel:
                 (value & 0xFFFF) - (0x10000 if value & 0x8000 else 0)
                 for value in packed
             ], dtype=np.float32)
-            base_positions += signed * float(1 << SUBSET_CENTER_LOG_SCALE) * float(mpu)
+            base_positions += signed * float(1 << ZIVA_BASE_POSITION_LOG_SCALE) * float(mpu)
         indices = np.frombuffer(self.data, dtype="<u2", count=index_count, offset=index_base).astype(np.int32)
         triangles = indices[:index_count - (index_count % 3)].reshape(-1, 3)
         lookup = None

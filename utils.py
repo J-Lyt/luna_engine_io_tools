@@ -164,7 +164,7 @@ except Exception:
         pass
     class OperatorFileListElement:
         pass
-    StringProperty = IntProperty = FloatProperty = BoolProperty = EnumProperty = PointerProperty = CollectionProperty = _property_stub
+    StringProperty = IntProperty = FloatProperty = FloatVectorProperty = BoolProperty = EnumProperty = PointerProperty = CollectionProperty = _property_stub
     class _DummyMenu:
         def append(self, _func):
             pass

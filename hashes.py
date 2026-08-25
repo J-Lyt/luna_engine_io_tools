@@ -101,4 +101,14 @@ BLOCK_HASHES = {
     "ModelStrandSBs": string_crc32("Model Spline Skin Binding"),
     "ModelStrandJBs": string_crc32("Model Spline Joint Binding"),
     "ModelStrandCVWeights": string_crc32("Model Spline Joint Weights"),
+    # Added: present in sample .model files but missing from this table.
+    # Cross-checked against InsomniacTools/AssetCore/DataFile/SectionHashes.cs
+    # and ALERT's dat1lib/types/sections/model/locators.py.
+    "ModelLocator": string_crc32("Model Locator"),
+    "ModelLocatorLookup": string_crc32("Model Locator Lookup"),
+    "ModelRagDollMetaData": string_crc32("Model's Ragdoll meta data"),
+    # Source string for these two not confirmed by brute force; hardcoded
+    # from InsomniacTools/ALERT instead of derived via string_crc32.
+    "ModelIKSetupData": 0x9A434B29,
+    "ModelAmbientShadowPrims": 0x7CA37DA0,
 }

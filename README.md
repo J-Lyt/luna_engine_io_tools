@@ -8,7 +8,6 @@
 * **Model export**: Export selected Blender model data back into the Luna Engine model format.
 * **Morph2 editing**: Import model Morph2 data as shape keys, share controls across subsets, and rebuild Morph2 on export.
 * **Ziva replacement tools**: Evaluate compiled Ziva2 rigs, transfer named channels to replacement topology, and capture joint-driven poses as editable Morph2 targets.
-* **Hair Import/Export**: Hair Yeah.
 * **Animation import**: Import `.animclip` files and apply them to an existing armature or camera.
 * **Animation export**: Export the selected armature or camera animation as an `.animclip` file.
 * **Camera animation support**: Work with camera clips as well as skeletal animation clips.
