@@ -685,7 +685,21 @@ def _smooth_stitches_for_vertices(vertices, position_tolerance, normal_dot_toler
     groups = {}
     for index in range(count):
         groups.setdefault(find(index), []).append(index)
-    stitches = [indices for indices in groups.values() if len(indices) > 1]
+    raw_stitches = [indices for indices in groups.values() if len(indices) > 1]
+
+    # NOTE: union() above builds connected components under a proximity
+    # relation (A~B, B~C implies A,B,C are one component) rather than a
+    # strict clique (every pair mutually within tolerance). On flat/symmetric
+    # regions (e.g. a mask) this can chain far more vertices into one
+    # component than are genuinely coincident, occasionally exceeding
+    # MORPH_STITCH_INDEX_MAX. This used to raise and abort the whole export.
+    # Instead, split any oversized component into MORPH_STITCH_INDEX_MAX-sized
+    # sub-groups by recursive farthest-point bisection, so real seam data
+    # near the split is still preserved as multiple smaller stitch groups
+    # rather than being lost entirely (or aborting the export).
+    stitches = []
+    for indices in raw_stitches:
+        stitches.extend(_split_oversized_stitch_group(indices, vertices, MORPH_STITCH_INDEX_MAX))
     stitches.sort(key=lambda indices: indices[0])
     for indices in stitches:
         if len(indices) > MORPH_STITCH_INDEX_MAX:
@@ -696,23 +710,99 @@ def _smooth_stitches_for_vertices(vertices, position_tolerance, normal_dot_toler
     return stitches
 
 
+def _split_oversized_stitch_group(indices, vertices, max_size):
+    if len(indices) <= max_size:
+        return [indices]
+
+    def dist_sq(a, b):
+        pa, pb = vertices[a]["co"], vertices[b]["co"]
+        return sum((float(pa[axis]) - float(pb[axis])) ** 2 for axis in range(3))
+
+    # Farthest-point bisection: pick the two mutually-farthest-ish vertices
+    # in this component as poles, assign every other vertex to its nearest
+    # pole, then recurse on each half. Deterministic and always terminates
+    # since each half is strictly smaller than the input (for len > 1).
+    anchor = indices[0]
+    pole_a = max(indices, key=lambda i: dist_sq(anchor, i))
+    pole_b = max(indices, key=lambda i: dist_sq(pole_a, i))
+    if pole_a == pole_b:
+        # All coincident (degenerate case) - just chunk arbitrarily.
+        return [indices[i:i + max_size] for i in range(0, len(indices), max_size)]
+
+    group_a, group_b = [], []
+    for index in indices:
+        if dist_sq(index, pole_a) <= dist_sq(index, pole_b):
+            group_a.append(index)
+        else:
+            group_b.append(index)
+
+    # Guard against a degenerate split where everything lands on one side
+    # (shouldn't happen given pole_a != pole_b, but be defensive).
+    if not group_a or not group_b:
+        return [indices[i:i + max_size] for i in range(0, len(indices), max_size)]
+
+    result = []
+    for half in (group_a, group_b):
+        if len(half) > 1:
+            result.extend(_split_oversized_stitch_group(half, vertices, max_size))
+    return result
+
+
 def encode_model_smooth2(
     subsets,
     position_tolerance=SMOOTH_POSITION_TOLERANCE,
     normal_dot_tolerance=SMOOTH_NORMAL_DOT_TOLERANCE,
 ):
    
+    # NOTE: the on-disk format ties every stitch group's vertex indices to a
+    # single subset's local index space (each subset_infos record owns a
+    # slice of `stitches`/`stitch_indices`), so a stitch group can only ever
+    # reference vertices belonging to ONE subset. Real seams frequently fall
+    # on a subset/material boundary though, so we still need to search for
+    # coincident vertices *across* all anim-affected subsets combined -
+    # otherwise those pairs are invisible to a purely per-subset search.
+    # Detection is global; encoding stays per-subset (subset boundary drops
+    # any single-vertex leftovers of a cross-subset match and counts them in
+    # "cross_subset_unstitched_count" so callers can warn about them instead
+    # of silently losing them).
+    combined_vertices = []
+    combined_owner = []  # (subset_position_in_subsets_list, local_index)
+    for subset_position, subset in enumerate(subsets):
+        if int(subset.get("anim_vert_count", 0)) <= 0:
+            continue
+        for local_index, vertex in enumerate(subset.get("vertices", [])):
+            combined_vertices.append(vertex)
+            combined_owner.append((subset_position, local_index))
+
+    combined_groups = _smooth_stitches_for_vertices(
+        combined_vertices, position_tolerance, normal_dot_tolerance
+    )
+
+    # Partition each globally-found group by which subset its members
+    # actually belong to.
+    per_subset_local_groups = {}  # subset_position -> list[list[local_index]]
+    cross_subset_unstitched_count = 0
+    for group in combined_groups:
+        by_subset = {}
+        for combined_index in group:
+            subset_position, local_index = combined_owner[combined_index]
+            by_subset.setdefault(subset_position, []).append(local_index)
+        for subset_position, local_indices in by_subset.items():
+            if len(local_indices) > 1:
+                per_subset_local_groups.setdefault(subset_position, []).append(sorted(local_indices))
+            else:
+                # This vertex's only match(es) in the group live in a
+                # different subset - the current format can't express that
+                # link, so it's dropped from the encoded data. Counted so
+                # the exporter can surface a real, honest warning.
+                cross_subset_unstitched_count += 1
+
     subset_infos = []
     stitches = []
     stitch_indices = []
-    for subset in subsets:
-        subset_stitches = []
-        if int(subset.get("anim_vert_count", 0)) > 0:
-            subset_stitches = _smooth_stitches_for_vertices(
-                subset.get("vertices", []),
-                position_tolerance,
-                normal_dot_tolerance,
-            )
+    for subset_position, subset in enumerate(subsets):
+        subset_stitches = per_subset_local_groups.get(subset_position, [])
+        subset_stitches.sort(key=lambda indices: indices[0])
         stitch_start = len(stitches)
         index_start = len(stitch_indices)
         for indices in subset_stitches:
@@ -756,4 +846,5 @@ def encode_model_smooth2(
         "subset_count": len(subset_infos),
         "stitch_count": len(stitches),
         "stitch_index_count": len(stitch_indices),
+        "cross_subset_unstitched_count": cross_subset_unstitched_count,
     }

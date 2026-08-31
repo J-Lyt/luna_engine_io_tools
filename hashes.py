@@ -90,6 +90,11 @@ BLOCK_HASHES = {
     "ModelSkinJointRemap": string_crc32("Model Skin Joint Remap"),
     "ModelLocator": string_crc32("Model Locator"),
     "ModelLocatorLookup": string_crc32("Model Locator Lookup"),
+    "ModelRagDollMetaData": string_crc32("Model's Ragdoll meta data"),
+    # Source strings for these two are not confirmed; values come from
+    # InsomniacTools/ALERT's known DAT1 section hashes.
+    "ModelIKSetupData": 0x9A434B29,
+    "ModelAmbientShadowPrims": 0x7CA37DA0,
     "ModelSplineSubsets": string_crc32("Model Spline Subsets"),
     "ModelSplines": string_crc32("Model Splines"),
     # The engine-facing name for this point stream is not yet known.

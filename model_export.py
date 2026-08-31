@@ -76,6 +76,7 @@ STG_HEADER_ALIGN = 16
 
 MODEL_BUILT_SIZE = 96
 MODEL_LOOK_SIZE = 64
+MODEL_BVH_RECORD_SIZE = 184  # native per-look ModelLookBVHInfo record size (see _build_inert_look_bvh_blocks)
 MODEL_LOOK_BUILT_SIZE = 80
 MODEL_LOOK_GROUP_SIZE = 24
 MODEL_STD_VERTEX_SIZE = 16
@@ -973,6 +974,111 @@ def _shape_key_export_data(obj, linear_matrix):
     return basis_coords, targets
 
 
+def _recompute_tangent_for_morph_targets(vertices, indices, targets):
+    """Blend a deformed-pose tangent into each morph-affected vertex's static
+    packed normal_tangent word.
+
+    Background: the engine's Morph2 runtime only stores/animates *position*
+    deltas (see model_morph.py's batch/delta format) - the packed
+    normal_tangent word baked per vertex is fixed at bind pose (weight=0) and
+    is never touched again. For small, localized Ziva-style targets that
+    mismatch is imperceptible; for larger custom blend shapes it shows up as
+    warped specular/normal-map shading in the deformed area, since the
+    tangent basis no longer matches the actual (deformed) surface.
+
+    This doesn't make the tangent dynamically correct at every blend weight
+    (the file format has no room for that - it's one static word), but it
+    replaces the pure bind-pose tangent with an average across bind pose and
+    each target's fully-applied deformation, which is a strictly better
+    single fixed compromise than "always exactly wrong once any target with
+    real magnitude is applied at all".
+    """
+    triangle_count = len(indices) // 3
+    if triangle_count == 0:
+        return 0
+
+    # Below this displacement, a vertex is only nominally "morph-affected"
+    # (present in the delta map with a tiny/near-zero magnitude - common for
+    # a target whose mask covers a whole material panel even though most of
+    # it barely moves). Recomputing the tangent there anyway introduces a
+    # small but real numerical perturbation vs. the original baked tangent
+    # (different local triangle-averaging neighborhood), which shows up as a
+    # faint, spread-out shading difference across the *entire* panel instead
+    # of staying localized to the part that's actually deforming. Vertices
+    # below this threshold keep their original bind-pose tangent untouched.
+    TANGENT_RECOMPUTE_MIN_DELTA = 0.0002  # meters (0.2mm)
+
+    base_positions = [vertex["co"] for vertex in vertices]
+    base_uvs = [vertex.get("uv0") or (0.0, 0.0) for vertex in vertices]
+
+    # tangent_accum[vertex_index] = [sum_x, sum_y, sum_z, flip_sum, contributions]
+    tangent_accum = {}
+
+    def accumulate(vertex_index, tangent, flip):
+        acc = tangent_accum.get(vertex_index)
+        if acc is None:
+            acc = [0.0, 0.0, 0.0, 0.0, 0]
+            tangent_accum[vertex_index] = acc
+        acc[0] += tangent[0]
+        acc[1] += tangent[1]
+        acc[2] += tangent[2]
+        acc[3] += flip
+        acc[4] += 1
+
+    for target in targets:
+        deltas = target.get("deltas") or {}
+        if not deltas:
+            continue
+        for triangle_index in range(triangle_count):
+            i0 = indices[triangle_index * 3]
+            i1 = indices[triangle_index * 3 + 1]
+            i2 = indices[triangle_index * 3 + 2]
+            d0 = deltas.get(i0)
+            d1 = deltas.get(i1)
+            d2 = deltas.get(i2)
+            if d0 is None and d1 is None and d2 is None:
+                continue
+            p0 = _vec_add(base_positions[i0], d0) if d0 is not None else base_positions[i0]
+            p1 = _vec_add(base_positions[i1], d1) if d1 is not None else base_positions[i1]
+            p2 = _vec_add(base_positions[i2], d2) if d2 is not None else base_positions[i2]
+            uvs = (base_uvs[i0], base_uvs[i1], base_uvs[i2])
+            try:
+                tangent, flip = _luna_triangle_tangent_space((p0, p1, p2), uvs)
+            except Exception:
+                continue
+            for i, d in ((i0, d0), (i1, d1), (i2, d2)):
+                if d is not None and _vec_len(d) >= TANGENT_RECOMPUTE_MIN_DELTA:
+                    accumulate(i, tangent, flip)
+
+    if not tangent_accum:
+        return 0
+
+    for vertex_index, (sx, sy, sz, flip_sum, count) in tangent_accum.items():
+        if count == 0:
+            continue
+        vertex = vertices[vertex_index]
+        bind_tangent = vertex["tangent"]
+        # Equal-weight blend between bind pose and the average
+        # fully-deformed tangent across every target touching this vertex.
+        deformed_avg = (sx / count, sy / count, sz / count)
+        blended = _vec_normalize(
+            _vec_add(bind_tangent, deformed_avg),
+            fallback=bind_tangent,
+        )
+        # Majority sign of the flips seen across contributing targets; tie
+        # (flip_sum == 0) keeps the original bind-pose handedness.
+        blended_flip = 1.0 if flip_sum >= 0 else -1.0
+
+        normal_tangent, tangent_y = _pack_normal_tangent(vertex["normal"], blended)
+        old_position_w = int(vertex["position_w"])
+        extrusion_encoded = (abs(old_position_w) >> 10) & 0x1F
+        vertex["normal_tangent"] = normal_tangent
+        vertex["position_w"] = _pack_position_w(tangent_y, blended_flip, extrusion_encoded)
+        vertex["tangent"] = blended
+
+    return len(tangent_accum)
+
+
 def _finalize_export_morph_topology(vertices, indices, source_targets):
     targets = []
     affected_vertices = set()
@@ -1495,6 +1601,8 @@ def _export_mesh_vertices(
         indices,
         source_morph_targets,
     )
+    if morph_targets:
+        _recompute_tangent_for_morph_targets(export_vertices, indices, morph_targets)
     return export_vertices, indices, bool(has_uv1), bool(has_uv2), morph_targets, anim_vert_count
 
 
@@ -4753,10 +4861,36 @@ def _source_morph_targets_for_older_scene(template, mesh_objects):
 
 
 def _build_inert_look_bvh_blocks(template):
+    # NOTE: previously wrote ModelLookBVHInfo as a single flat 16-byte
+    # all-zero placeholder (struct.pack("<4I", 0, 0, 0, 0)) regardless of how
+    # many ModelLook entries the model has. Native SM2 models store one
+    # 184-byte record PER look. With raytracing enabled in-game, the engine
+    # indexes into ModelLookBVHInfo per look and walks past the undersized
+    # 16-byte block into unrelated memory, causing an access violation crash
+    # (observed in-game as a crash when RT is toggled on with Luna-exported
+    # models; confirmed by three matching crash dumps, all faulting at the
+    # same address inside Spider-Man2.exe).
+    #
+    # Emit one properly-sized record per look instead, using the
+    # enabled=1/lod_count=1 "one-LOD" pattern (bytes 0..159 = 0, then
+    # u32[160:184] = (1, 1, look_index, 0, 31, 0)) that has been separately
+    # verified in-game not to crash. This is a minimal-but-real single-LOD
+    # RT state rather than a "disabled" flag: attempts using
+    # enabled=0/lod_count=0 for every look were not verified in-game and are
+    # not used here.
     replacements = {}
     bvh_hash = BLOCK_HASHES.get("ModelLookBVHInfo")
     if bvh_hash in template.blocks:
-        replacements[bvh_hash] = struct.pack("<4I", 0, 0, 0, 0)
+        look_payload = template.payload(BLOCK_HASHES["ModelLook"]) if BLOCK_HASHES["ModelLook"] in template.blocks else b""
+        look_count = len(look_payload) // MODEL_LOOK_SIZE if look_payload else 0
+        look_count = max(look_count, 1)
+        records = bytearray(MODEL_BVH_RECORD_SIZE * look_count)
+        for look_index in range(look_count):
+            struct.pack_into(
+                "<6I", records, look_index * MODEL_BVH_RECORD_SIZE + 160,
+                1, 1, look_index, 0, 31, 0,
+            )
+        replacements[bvh_hash] = bytes(records)
     bvh_lod_hash = BLOCK_HASHES.get("ModelLookBVHLoDInfo")
     if bvh_lod_hash in template.blocks:
         replacements[bvh_lod_hash] = b"\x00" * 64
@@ -5482,6 +5616,15 @@ class ExportEngineModel(Operator, ExportHelper):
                 if has_smooth:
                     smooth_info_block, smooth_metadata = encode_model_smooth2(subset_stats)
                     replacements[BLOCK_HASHES["ModelAnimVertSmoothInfo"]] = smooth_info_block
+                    cross_subset_unstitched = smooth_metadata.get("cross_subset_unstitched_count", 0)
+                    if cross_subset_unstitched > 0:
+                        export_warnings.append(
+                            f"{cross_subset_unstitched} seam vertex(es) at subset/material boundaries "
+                            "coincide with a vertex in a different subset and could not be included in "
+                            "any normal-smoothing stitch (the file format only supports stitches within "
+                            "a single subset). Shading/tangents may show a visible seam there under strong "
+                            "shape-key deformation."
+                        )
                 else:
                     remove_hashes.add(BLOCK_HASHES["ModelAnimVertSmoothInfo"])
                 if source_has_ziva:

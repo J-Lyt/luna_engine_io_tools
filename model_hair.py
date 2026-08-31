@@ -74,7 +74,13 @@ def _vec_from_i16(values, inv_scale):
     return tuple(component * inv_scale for component in values)
 
 
-def _vec_normalize(vec):
+def _hair_vec_normalize(vec):
+    # NOTE: was previously named _vec_normalize, which collided with the
+    # differently-behaved _vec_normalize() in model_export.py (different
+    # signature/degenerate-vector fallback). registration._wire_module_globals()
+    # merges all module-level names into a shared namespace, so that collision
+    # silently replaced this function with model_export's version at addon-load
+    # time. Renamed to keep it out of the shared-name collision entirely.
     length = math.sqrt(sum(component * component for component in vec))
     if length < 1e-12:
         return (0.0, 0.0, 0.0)
@@ -82,7 +88,7 @@ def _vec_normalize(vec):
 
 
 def _encode_octahedron(vec):
-    x, y, z = _vec_normalize(vec)
+    x, y, z = _hair_vec_normalize(vec)
     denom = max(abs(x) + abs(y) + abs(z), 1e-6)  # L1 norm, not max(|x|,|y|,|z|)
     x, y, z = x / denom, y / denom, z / denom
     if y >= 0:
