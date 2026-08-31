@@ -52,6 +52,11 @@ SKINNING_IDS = {v: k for k, v in SKINNING_NAMES.items()}
 HAIR_SUBSET_KEY = "engine_hair_subset_name"
 HAIR_SKINNING_KEY = "engine_hair_skinning_type"
 HAIR_SOURCE_KEY = "engine_hair_source"
+HAIR_SOURCE_PATH_KEY = "engine_hair_source_path"
+HAIR_SOURCE_SUBSET_INDEX_KEY = "engine_hair_source_subset_index"
+HAIR_LOOK_ID_KEY = "engine_hair_look_id"
+HAIR_LOD_ID_KEY = "engine_hair_lod_id"
+HAIR_LOD_MASK_KEY = "engine_hair_lod_mask"
 
 STRAND_BLOCK_NAMES = (
     "ModelStrandSubsets",
@@ -333,7 +338,7 @@ def _description_apply_editable(raw, values):
 
 class MODEL_PG_hair_description(PropertyGroup):
     lod_distance: FloatProperty(name="LOD Distance", default=30.0, min=0.0, soft_max=500.0)
-    lod_reduction: FloatProperty(name="LOD Reduction", default=0.5, min=0.0, max=1.0, subtype='FACTOR')
+    lod_reduction: FloatProperty(name="LOD Reduction", default=0.5, min=0.0, soft_max=1.0)
     tess_max: IntProperty(name="Tessellation Max", default=8, min=0, soft_max=64)
     tess_min: IntProperty(name="Tessellation Min", default=2, min=0, soft_max=64)
     clump_max: IntProperty(name="Strands Per Clump Max", default=1, min=0, soft_max=4095)
@@ -672,6 +677,239 @@ def _read_guide_mesh_weights(guide_obj):
     return per_cv
 
 
+def _hair_source_matches_template(obj, template):
+    source_name = str(obj.get(HAIR_SOURCE_KEY, "") or "")
+    if source_name and os.path.basename(template.filepath).lower() != source_name.lower():
+        return False
+    source_path = str(obj.get(HAIR_SOURCE_PATH_KEY, "") or "")
+    if source_path:
+        source_path = os.path.normcase(os.path.abspath(source_path))
+        template_path = os.path.normcase(os.path.abspath(template.filepath))
+        if source_path != template_path and os.path.basename(source_path) != os.path.basename(template_path):
+            return False
+    return True
+
+
+def _hair_source_subset_for_object(obj, template, subsets=None):
+    if template is None or not _hair_source_matches_template(obj, template):
+        return None
+    subsets = subsets if subsets is not None else _read_strand_subsets(template)
+    subset_name = str(obj.get(HAIR_SUBSET_KEY) or obj.name)
+    source_index = obj.get(HAIR_SOURCE_SUBSET_INDEX_KEY)
+    try:
+        source_index = int(source_index)
+    except (TypeError, ValueError):
+        source_index = -1
+    if 0 <= source_index < len(subsets):
+        subset = subsets[source_index]
+        if subset["name"] == subset_name:
+            return subset
+    matches = [subset for subset in subsets if subset["name"] == subset_name]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _hair_current_weight_rows(obj):
+    curve_data = obj.data
+    guide_name = obj.get(HAIR_GUIDE_MESH_KEY)
+    guide_obj = bpy.data.objects.get(guide_name) if guide_name else None
+    if guide_obj is not None and guide_obj.type == 'MESH':
+        rows = _read_guide_mesh_weights(guide_obj)
+        return rows if len(rows) == len(curve_data.points) else None
+
+    joint_attrs = [
+        curve_data.attributes.get(f"hair_joint_{slot}")
+        for slot in range(MAX_STRAND_JOINT_WEIGHTS)
+    ]
+    weight_attrs = [
+        curve_data.attributes.get(f"hair_weight_{slot}")
+        for slot in range(MAX_STRAND_JOINT_WEIGHTS)
+    ]
+    rows = [{} for _point in curve_data.points]
+    for curve_index in range(len(curve_data.curves)):
+        start, end = _curve_point_range(curve_data, curve_index)
+        names = []
+        for attr in joint_attrs:
+            name = attr.data[curve_index].value if attr is not None else ""
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="ignore")
+            names.append(name)
+        for point_index in range(start, end):
+            row = rows[point_index]
+            for slot, name in enumerate(names):
+                if not name or weight_attrs[slot] is None:
+                    continue
+                weight = float(weight_attrs[slot].data[point_index].value)
+                if weight > 0.0:
+                    row[name] = row.get(name, 0.0) + weight
+    return rows
+
+
+def _hair_joint_skinning_matches_source(obj, template, subset, joint_names, tolerance=1e-6):
+    if subset is None or subset["skinning_type"] != SKINNING_JOINTS:
+        return False
+    if str(obj.get(HAIR_SKINNING_KEY) or "joints") != "joints":
+        return False
+    curve_data = obj.data
+    if len(curve_data.curves) != subset["strand_count"]:
+        return False
+    current_rows = _hair_current_weight_rows(obj)
+    if current_rows is None:
+        return False
+
+    strand_off, strand_size = template.blocks.get(BLOCK_HASHES["ModelStrands"], (0, 0))
+    jb_off, jb_size = template.blocks.get(BLOCK_HASHES["ModelStrandJBs"], (0, 0))
+    cvw_off, cvw_size = template.blocks.get(BLOCK_HASHES["ModelStrandCVWeights"], (0, 0))
+    if not strand_size or not jb_size or not cvw_size:
+        return False
+
+    for local_index in range(subset["strand_count"]):
+        strand_index = subset["strand_start"] + local_index
+        record = _unpack_strand(template.data, strand_off + strand_index * STRAND_SIZE)
+        start, end = _curve_point_range(curve_data, local_index)
+        if end - start != record["cv_count"]:
+            return False
+        indices = _unpack_joint_binding(
+            template.data,
+            jb_off + strand_index * JOINT_BINDING_SIZE,
+        )
+        names = [
+            joint_names[index] if 0 <= index < len(joint_names) else ""
+            for index in indices
+        ]
+        for cv_local in range(record["cv_count"]):
+            cv_index = record["cv_start"] + cv_local
+            packed_weights = _unpack_cv_weights(
+                template.data,
+                cvw_off + cv_index * CV_WEIGHTS_SIZE,
+            )
+            source_row = {}
+            for slot, (name, packed_weight) in enumerate(zip(names, packed_weights)):
+                if not name:
+                    continue
+                weight = packed_weight if slot < 5 else packed_weight * packed_weight
+                if weight > tolerance:
+                    source_row[name] = source_row.get(name, 0.0) + weight
+            current_row = {
+                name: float(weight)
+                for name, weight in current_rows[start + cv_local].items()
+                if abs(float(weight)) > tolerance
+            }
+            for name in source_row.keys() | current_row.keys():
+                if abs(source_row.get(name, 0.0) - current_row.get(name, 0.0)) > tolerance:
+                    return False
+    return True
+
+
+def _hair_vector_close(left, right, tolerance=1e-6):
+    return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(left, right))
+
+
+def _hair_geometry_matches_source(obj, template, subset, mpu, tolerance=1e-6):
+    curve_data = obj.data
+    if len(curve_data.curves) != subset["strand_count"]:
+        return False
+    if not _hair_vector_close(
+        tuple(value for row in obj.matrix_local for value in row),
+        tuple(value for row in mathutils.Matrix.Identity(4) for value in row),
+        tolerance,
+    ):
+        return False
+    normal_attr = curve_data.attributes.get("hair_normal")
+    uv_attr = curve_data.attributes.get("hair_uv")
+    basis_u_attr = curve_data.attributes.get("hair_basis_u")
+    basis_v_attr = curve_data.attributes.get("hair_basis_v")
+    if any(attr is None for attr in (normal_attr, uv_attr, basis_u_attr, basis_v_attr)):
+        return False
+
+    strand_off, strand_size = template.blocks.get(BLOCK_HASHES["ModelStrands"], (0, 0))
+    cv_off, cv_size = template.blocks.get(BLOCK_HASHES["ModelStrandCVs"], (0, 0))
+    if not strand_size or not cv_size:
+        return False
+    rotation = SWIZZLE_MAT.to_3x3()
+    positions = curve_data.attributes["position"].data
+    for local_index in range(subset["strand_count"]):
+        strand_index = subset["strand_start"] + local_index
+        record = _unpack_strand(template.data, strand_off + strand_index * STRAND_SIZE)
+        start, end = _curve_point_range(curve_data, local_index)
+        if end - start != record["cv_count"]:
+            return False
+        source_uv = (record["uv"][0] / 65535.0, record["uv"][1] / 65535.0)
+        source_u = rotation @ mathutils.Vector(_unpack_normal_bytes(record["basis_u_bytes"]))
+        source_v = rotation @ mathutils.Vector(_unpack_normal_bytes(record["basis_v_bytes"]))
+        if not _hair_vector_close(uv_attr.data[local_index].vector, source_uv, tolerance):
+            return False
+        if not _hair_vector_close(basis_u_attr.data[local_index].vector, source_u, tolerance):
+            return False
+        if not _hair_vector_close(basis_v_attr.data[local_index].vector, source_v, tolerance):
+            return False
+        for cv_local in range(record["cv_count"]):
+            cv_index = record["cv_start"] + cv_local
+            position_i16, normal_bytes = _unpack_cv(
+                template.data,
+                cv_off + cv_index * CV_SIZE,
+            )
+            source_position = rotation @ mathutils.Vector(_vec_from_i16(position_i16, mpu))
+            source_normal = rotation @ mathutils.Vector(_unpack_normal_bytes(normal_bytes))
+            point_index = start + cv_local
+            if not _hair_vector_close(positions[point_index].vector, source_position, tolerance):
+                return False
+            if not _hair_vector_close(normal_attr.data[point_index].vector, source_normal, tolerance):
+                return False
+    return True
+
+
+def _hair_description_matches_source(obj, source_description, tolerance=1e-6):
+    source_values = _description_get_editable(source_description)
+    current_values = _description_get_editable(
+        _description_from_object_props(obj, source_description)
+    )
+    for key, source_value in source_values.items():
+        current_value = current_values[key]
+        if key == "color_points":
+            for source_color, current_color in zip(source_value, current_value):
+                if not _hair_vector_close(source_color, current_color, tolerance):
+                    return False
+        elif isinstance(source_value, float):
+            if abs(source_value - current_value) > tolerance:
+                return False
+        elif source_value != current_value:
+            return False
+    return True
+
+
+def _hair_can_preserve_source_blocks(objects, template, source_subsets):
+    if template is None:
+        return False
+    imported_subsets = [
+        subset for subset in source_subsets
+        if subset["lod_id"] == 0
+        and subset["strand_count"] > 0
+        and subset["skinning_type"] in (SKINNING_JOINTS, SKINNING_GEOMETRY)
+    ]
+    # Geometry-bound roots may need rebinding after an edited scalp export.
+    if len(objects) != len(imported_subsets) or any(
+        subset["skinning_type"] != SKINNING_JOINTS for subset in imported_subsets
+    ):
+        return False
+    joint_names = _read_donor_joint_names(template)
+    mpu = _template_meters_per_unit(template)
+    used_indices = set()
+    for obj in objects:
+        subset = _hair_source_subset_for_object(obj, template, source_subsets)
+        if subset is None or subset["index"] in used_indices:
+            return False
+        used_indices.add(subset["index"])
+        if str(obj.get(HAIR_SUBSET_KEY) or obj.name) != subset["name"]:
+            return False
+        if not _hair_geometry_matches_source(obj, template, subset, mpu):
+            return False
+        if not _hair_joint_skinning_matches_source(obj, template, subset, joint_names):
+            return False
+        if not _hair_description_matches_source(obj, subset["description"]):
+            return False
+    return used_indices == {subset["index"] for subset in imported_subsets}
+
+
 # Dunno if i should keep this since it was useful for debug
 
 
@@ -692,7 +930,7 @@ def import_strand_hair(filepath, arm, context):
         if subset["skinning_type"] not in (SKINNING_JOINTS, SKINNING_GEOMETRY):
             continue
         if subset["lod_id"] != 0:
-            continue  # only the highest-detail LOD; every export writes back as LOD0-only anyway
+            continue  # Only the highest-detail strand LOD is exposed for editing in Blender.
         strands = _read_subset_strands(template, subset, joint_names, mpu)
         if not strands:
             continue
@@ -755,6 +993,11 @@ def import_strand_hair(filepath, arm, context):
         obj[HAIR_SUBSET_KEY] = subset["name"]
         obj[HAIR_SKINNING_KEY] = SKINNING_NAMES.get(subset["skinning_type"], "joints")
         obj[HAIR_SOURCE_KEY] = os.path.basename(filepath)
+        obj[HAIR_SOURCE_PATH_KEY] = os.path.abspath(filepath)
+        obj[HAIR_SOURCE_SUBSET_INDEX_KEY] = int(subset["index"])
+        obj[HAIR_LOOK_ID_KEY] = int(subset["look_id"])
+        obj[HAIR_LOD_ID_KEY] = int(subset["lod_id"])
+        obj[HAIR_LOD_MASK_KEY] = int(subset["lod_mask"])
         obj[HAIR_DESCRIPTION_KEY] = base64.b64encode(subset["description"]).decode("ascii")
         _description_to_object_props(obj, subset["description"])
         context.scene.collection.objects.link(obj)
@@ -861,12 +1104,34 @@ def rebind_geometry_hair(hair_obj, scalp_obj):
     return bindings, unbound
 
 
-def compile_export_hair(arm):
+def compile_export_hair(arm, source_template=None):
     objects = hair_objects_for_armature(arm)
     if not objects:
         return None, []
 
+    source_subsets = _read_strand_subsets(source_template) if source_template is not None else []
+    if _hair_can_preserve_source_blocks(objects, source_template, source_subsets):
+        return {
+            BLOCK_HASHES[name]: source_template.payload(BLOCK_HASHES[name])
+            for name in STRAND_BLOCK_NAMES
+            if BLOCK_HASHES[name] in source_template.blocks
+        }, []
+
+    objects.sort(key=lambda obj: (
+        int(obj.get(HAIR_SOURCE_SUBSET_INDEX_KEY, 0x7FFFFFFF)),
+        str(obj.get(HAIR_SUBSET_KEY) or obj.name),
+    ))
+
     joint_by_name = {bone.name: bone.get("engine_joint_index", -1) for bone in arm.data.bones}
+    source_joint_names = (
+        _read_donor_joint_names(source_template)
+        if source_template is not None else []
+    )
+    source_subset_payload = (
+        source_template.payload(BLOCK_HASHES["ModelStrandSubsets"])
+        if source_template is not None and BLOCK_HASHES["ModelStrandSubsets"] in source_template.blocks
+        else b""
+    )
     rotation_inv = SWIZZLE_MAT.to_3x3().inverted()
 
     mpu_source = float(arm.get("engine_model_source_common_mpu", 0.0) or arm.get("engine_mpu", 0.0) or 0.0)
@@ -884,11 +1149,15 @@ def compile_export_hair(arm):
     cv_cursor = 0
     warnings = []
     any_geometry = False
+    matched_source_subset_indices = set()
 
     for obj in objects:
         curve_data = obj.data
         subset_name = str(obj.get(HAIR_SUBSET_KEY) or obj.name)
         skinning_type = SKINNING_IDS.get(str(obj.get(HAIR_SKINNING_KEY) or "joints"), SKINNING_JOINTS)
+        source_subset = _hair_source_subset_for_object(obj, source_template, source_subsets)
+        if source_subset is not None:
+            matched_source_subset_indices.add(source_subset["index"])
 
         scalp_obj = None
         root_bindings = None
@@ -924,6 +1193,17 @@ def compile_export_hair(arm):
                         "Please paint weights without adding or deleting vertices."
                     )
 
+        preserve_source_skinning = (
+            skinning_type == SKINNING_JOINTS
+            and source_template is not None
+            and _hair_joint_skinning_matches_source(
+                obj,
+                source_template,
+                source_subset,
+                source_joint_names,
+            )
+        )
+
         curve_count = len(curve_data.curves)
         for curve_index in range(curve_count):
             start, end = _curve_point_range(curve_data, curve_index)
@@ -948,7 +1228,28 @@ def compile_export_hair(arm):
             )
 
             if skinning_type == SKINNING_JOINTS:
-                if guide_weights_per_cv is not None:
+                if preserve_source_skinning:
+                    source_strand_index = source_subset["strand_start"] + curve_index
+                    source_record = _unpack_strand(
+                        source_template.data,
+                        source_template.blocks[BLOCK_HASHES["ModelStrands"]][0]
+                        + source_strand_index * STRAND_SIZE,
+                    )
+                    source_jb_offset = (
+                        source_template.blocks[BLOCK_HASHES["ModelStrandJBs"]][0]
+                        + source_strand_index * JOINT_BINDING_SIZE
+                    )
+                    source_cvw_offset = (
+                        source_template.blocks[BLOCK_HASHES["ModelStrandCVWeights"]][0]
+                        + source_record["cv_start"] * CV_WEIGHTS_SIZE
+                    )
+                    jb_bytes += source_template.data[
+                        source_jb_offset : source_jb_offset + JOINT_BINDING_SIZE
+                    ]
+                    cvw_bytes += source_template.data[
+                        source_cvw_offset : source_cvw_offset + cv_count * CV_WEIGHTS_SIZE
+                    ]
+                elif guide_weights_per_cv is not None:
                     cv_rows = guide_weights_per_cv[start:end]
                     active_names = sorted({name for row in cv_rows for name in row})
                     missing = [name for name in active_names if name not in joint_by_name]
@@ -977,16 +1278,17 @@ def compile_export_hair(arm):
                         ][: len(active_names)] if active_names else []
                         raw_weights.append(row)
 
-                if active_names and raw_weights and any(any(row) for row in raw_weights):
-                    quantized, kept_order = _quantize_strand_weights(raw_weights)
-                    kept_names = [active_names[index] for index in kept_order]
-                    jb_bytes += _pack_joint_binding([joint_by_name[name] for name in kept_names])
-                    for row in quantized:
-                        cvw_bytes += _pack_cv_weights(row)
-                else:
-                    jb_bytes += _pack_joint_binding([])
-                    for _ in range(cv_count):
-                        cvw_bytes += _pack_cv_weights([0.0] * MAX_STRAND_JOINT_WEIGHTS)
+                if not preserve_source_skinning:
+                    if active_names and raw_weights and any(any(row) for row in raw_weights):
+                        quantized, kept_order = _quantize_strand_weights(raw_weights)
+                        kept_names = [active_names[index] for index in kept_order]
+                        jb_bytes += _pack_joint_binding([joint_by_name[name] for name in kept_names])
+                        for row in quantized:
+                            cvw_bytes += _pack_cv_weights(row)
+                    else:
+                        jb_bytes += _pack_joint_binding([])
+                        for _ in range(cv_count):
+                            cvw_bytes += _pack_cv_weights([0.0] * MAX_STRAND_JOINT_WEIGHTS)
             else:
                 jb_bytes += _pack_joint_binding([])
                 for _ in range(cv_count):
@@ -1017,15 +1319,55 @@ def compile_export_hair(arm):
                 raw_description = b""
         description = _description_from_object_props(obj, raw_description)
 
-        subset_record = bytearray(SUBSET_SIZE)
+        if source_subset is not None and source_subset_payload:
+            source_record_start = source_subset["index"] * SUBSET_SIZE
+            subset_record = bytearray(
+                source_subset_payload[source_record_start : source_record_start + SUBSET_SIZE]
+            )
+        else:
+            subset_record = bytearray(SUBSET_SIZE)
         struct.pack_into("<I", subset_record, SUBSET_NAME_HASH_OFF, string_crc32(subset_name))
+        if source_subset is not None and subset_name != source_subset["name"]:
+            struct.pack_into("<I", subset_record, SUBSET_NAME_OFFSET_OFF, 0)
         struct.pack_into("<I", subset_record, SUBSET_STRAND_COUNT_OFF, curve_count)
         struct.pack_into("<I", subset_record, SUBSET_STRAND_START_OFF, strand_cursor)
-        pack = (skinning_type & 0x3) | (0x3FF << 2) | (0 << 12) | (0b1 << 16)
+        source_look_id = source_subset["look_id"] if source_subset is not None else -1
+        source_lod_id = source_subset["lod_id"] if source_subset is not None else 0
+        source_lod_mask = source_subset["lod_mask"] if source_subset is not None else 1
+        look_id = int(obj.get(HAIR_LOOK_ID_KEY, source_look_id))
+        lod_id = int(obj.get(HAIR_LOD_ID_KEY, source_lod_id))
+        lod_mask = int(obj.get(HAIR_LOD_MASK_KEY, source_lod_mask))
+        reserved = 0
+        if source_subset is not None:
+            source_pack = struct.unpack_from(
+                "<I",
+                source_subset_payload,
+                source_subset["index"] * SUBSET_SIZE + SUBSET_SKINNING_PACK_OFF,
+            )[0]
+            reserved = source_pack & ~0x003FFFFF
+        pack = (
+            reserved
+            | (skinning_type & 0x3)
+            | ((look_id & 0x3FF) << 2)
+            | ((lod_id & 0xF) << 12)
+            | ((lod_mask & 0x3F) << 16)
+        )
         struct.pack_into("<I", subset_record, SUBSET_SKINNING_PACK_OFF, pack)
         subset_record[SUBSET_DESCRIPTION_OFF : SUBSET_DESCRIPTION_OFF + DESCRIPTION_SIZE] = description
         subset_bytes += subset_record
         strand_cursor += curve_count
+
+    # Keep source placeholder subsets. Some MSM2 assets include zero-strand
+    # records with opaque engine metadata even though Blender has no object to
+    # represent them.
+    if source_subset_payload:
+        for subset in source_subsets:
+            if subset["index"] in matched_source_subset_indices or subset["strand_count"] != 0:
+                continue
+            source_record_start = subset["index"] * SUBSET_SIZE
+            subset_bytes += source_subset_payload[
+                source_record_start : source_record_start + SUBSET_SIZE
+            ]
 
     if not subset_bytes:
         return None, warnings

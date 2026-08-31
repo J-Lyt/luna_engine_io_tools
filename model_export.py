@@ -5779,7 +5779,7 @@ class ExportEngineModel(Operator, ExportHelper):
                 BLOCK_HASHES["ModelSubsetGeomData"]: geom_block,
             }
             if arm is not None and hair_objects_for_armature(arm):
-                hair_blocks, hair_warnings = compile_export_hair(arm)
+                hair_blocks, hair_warnings = compile_export_hair(arm, template)
                 if hair_blocks:
                     replacements.update(hair_blocks)
                     # ModelBuilt.m_StrandSubsetCount cant be zero
