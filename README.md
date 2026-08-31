@@ -8,7 +8,6 @@
 * **Model export**: Export selected Blender model data back into the Luna Engine model format.
 * **Morph editing**: Import Spider-Man 2 Morph2 or Remastered legacy morph data as shape keys, share controls across subsets, and rebuild the matching morph format on export.
 * **Ziva replacement tools**: Evaluate compiled Ziva2 rigs, transfer named channels to replacement topology, and capture joint-driven poses as editable Morph2 targets.
-* **Hair Import/Export**: Hair Yeah.
 * **Animation import**: Import `.animclip` files and apply them to an existing armature or camera.
 * **Animation export**: Export the selected armature or camera animation as an `.animclip` file.
 * **Camera animation support**: Work with camera clips as well as skeletal animation clips.
