@@ -41,6 +41,7 @@ from .model_import import (
     MODEL_SUBSET_FLAGS_OFFSET,
     MODEL_SUBSET_INDEX_COUNT_OFFSET,
     MODEL_SUBSET_INDEX_DATA_OFFSET,
+    MODEL_SUBSET_LOD_MASK_OFFSET,
     MODEL_SUBSET_MATERIAL_INDEX_OFFSET,
     MODEL_SUBSET_MPU_OFFSET,
     MODEL_SUBSET_RECORD_SIZE,
@@ -70,6 +71,7 @@ DAT1_CACHELINE_ALIGN = 64
 MSMR_SKIN_BATCH_MAX_VERTEX_COUNT = 2560
 MSMR_LOOK_LOD_COUNT = 6
 MSMR_LOOK_BUILT_LOD_MASK_SIZE = 256
+MSM2_COMPACT_LOD_COUNT = 6
 STG_MAGIC = 0x00475453
 STG_VERSION = 0x1
 STG_HEADER_ALIGN = 16
@@ -2255,6 +2257,7 @@ def _build_geometry_and_subset_blocks(
     source_joint_count,
     export_warnings=None,
     source_morph_targets_by_subset=None,
+    compact_lod0=False,
 ):
     subset_block_hash = BLOCK_HASHES["ModelSubset"]
     original_subset_block = template.payload(subset_block_hash) if subset_block_hash in template.blocks else b""
@@ -2340,6 +2343,31 @@ def _build_geometry_and_subset_blocks(
                 })
             custom_stream_index += _align(subset_stats["custom_stream_count"], 2)
         subset_index_map[int(old_index)] = mapped_indices
+    if compact_lod0:
+        imported_source_indices = [
+            int(stat.get("source_subset_index", -1))
+            for stat in stats
+        ]
+        expected_lod0_subset_ids = _msm2_lod0_subset_ids(template)
+        if imported_source_indices != expected_lod0_subset_ids:
+            raise ValueError(
+                "Compact LOD0 export needs every source LOD0 subset exactly once. "
+                "Re-import the model without 'Import All LODs', keep every imported mesh parented to its "
+                "armature, then export again."
+            )
+        lod_records = []
+        for lod_index in range(MSM2_COMPACT_LOD_COUNT):
+            for source_record in subset_records:
+                record = bytearray(source_record)
+                struct.pack_into(
+                    "<H",
+                    record,
+                    MODEL_SUBSET_LOD_MASK_OFFSET,
+                    1 << lod_index,
+                )
+                lod_records.append(bytes(record))
+        subset_records = lod_records
+
     return (
         b"".join(subset_records),
         bytes(geom_buffer),
@@ -3092,6 +3120,36 @@ def _msmr_hybrid_morph_targets(
                     "deltas": deltas,
                 })
     return targets
+
+
+def _msm2_lod0_subset_ids(template):
+    look = template.payload(BLOCK_HASHES["ModelLook"])
+    built = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+    if len(look) % MODEL_LOOK_SIZE:
+        raise ValueError("The original MSM2 Model Look block is truncated")
+    look_count = len(look) // MODEL_LOOK_SIZE
+    if len(built) < look_count * MODEL_LOOK_BUILT_SIZE:
+        raise ValueError("The original MSM2 Model Look Built block is truncated")
+
+    result = set()
+    for look_index in range(look_count):
+        look_offset = look_index * MODEL_LOOK_SIZE
+        start, count = struct.unpack_from("<HH", look, look_offset)
+        built_offset = look_index * MODEL_LOOK_BUILT_SIZE
+        ids_offset = struct.unpack_from("<Q", built, built_offset)[0]
+        ids_count = struct.unpack_from("<H", built, built_offset + 56)[0]
+        ids_end = int(ids_offset) + int(ids_count) * 2
+        if not 0 <= int(ids_offset) <= ids_end <= len(built):
+            raise ValueError("The original MSM2 Model Look Built subset list is invalid")
+        if int(start) + int(count) > int(ids_count):
+            raise ValueError("The original MSM2 Model Look LOD0 range is invalid")
+        ids = (
+            struct.unpack_from(f"<{int(ids_count)}H", built, int(ids_offset))
+            if ids_count
+            else ()
+        )
+        result.update(int(value) for value in ids[int(start):int(start) + int(count)])
+    return sorted(result)
 
 
 def _msmr_lod0_subset_ids(template):
@@ -4364,6 +4422,110 @@ def _build_look_group_block(groups, look_count, string_pool):
     return bytes(struct.pack("<B", len(groups)) + records + indices)
 
 
+def _build_msm2_compact_lod0_look_blocks(template, subset_count, subset_index_map):
+    """Use cloned LOD0 subset records for every MSM2 render distance."""
+    original_look = template.payload(BLOCK_HASHES["ModelLook"])
+    original_built = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+    if len(original_look) % MODEL_LOOK_SIZE:
+        raise ValueError("The original MSM2 Model Look block is truncated")
+    look_count = len(original_look) // MODEL_LOOK_SIZE
+    headers_size = look_count * MODEL_LOOK_BUILT_SIZE
+    if len(original_built) < headers_size:
+        raise ValueError("The original MSM2 Model Look Built block is truncated")
+
+    source_headers = []
+    for look_index in range(look_count):
+        header_offset = look_index * MODEL_LOOK_BUILT_SIZE
+        source_headers.append((
+            tuple(struct.unpack_from("<7Q", original_built, header_offset)),
+            tuple(struct.unpack_from("<6H", original_built, header_offset + 56)),
+            tuple(struct.unpack_from("<3I", original_built, header_offset + 68)),
+        ))
+
+    def source_section(look_index, section_index):
+        offsets, counts, _hashes = source_headers[look_index]
+        start = int(offsets[section_index])
+        if not 0 <= start <= len(original_built):
+            raise ValueError("The original MSM2 Model Look Built section is invalid")
+        if section_index < 6:
+            size = int(counts[section_index]) * 2
+        else:
+            following = [
+                int(offset)
+                for offsets_other, _counts_other, _hashes_other in source_headers
+                for offset in offsets_other
+                if start < int(offset) <= len(original_built)
+            ]
+            size = min(following, default=len(original_built)) - start
+        if size < 0 or start + size > len(original_built):
+            raise ValueError("The original MSM2 Model Look Built section is truncated")
+        return bytes(original_built[start:start + size]), (
+            int(counts[section_index]) if section_index < 6 else 0
+        )
+
+    look_records = bytearray()
+    compact_ids_by_look = []
+    for look_index in range(look_count):
+        source_record_offset = look_index * MODEL_LOOK_SIZE
+        record = bytearray(
+            original_look[source_record_offset:source_record_offset + MODEL_LOOK_SIZE]
+        )
+        ids_data, ids_count = source_section(look_index, 0)
+        source_ids = list(struct.unpack(f"<{ids_count}H", ids_data)) if ids_count else []
+        lod0_start, lod0_count = struct.unpack_from("<HH", record, 0)
+        if int(lod0_start) + int(lod0_count) > len(source_ids):
+            raise ValueError("The original MSM2 Model Look LOD0 range is invalid")
+        lod0_ids = _mapped_subset_ids(
+            source_ids[int(lod0_start):int(lod0_start) + int(lod0_count)],
+            subset_index_map,
+            subset_count,
+        )
+
+        compact_ids = []
+        lod_ranges = []
+        for lod_index in range(MSM2_COMPACT_LOD_COUNT):
+            lod_start = len(compact_ids)
+            shifted = [lod_index * int(subset_count) + int(value) for value in lod0_ids]
+            if shifted and max(shifted) > 0xFFFF:
+                raise ValueError("Compact MSM2 LOD subset indexes exceed the format limit")
+            compact_ids.extend(shifted)
+            lod_ranges.append((lod_start, len(shifted)))
+        lod_ranges.extend([lod_ranges[-1]] * (8 - len(lod_ranges)))
+        for lod_index, (lod_start, lod_count) in enumerate(lod_ranges):
+            if lod_start > 0xFFFF or lod_count > 0xFFFF:
+                raise ValueError("Compact MSM2 look ranges exceed the format limit")
+            struct.pack_into("<HH", record, lod_index * 4, lod_start, lod_count)
+        look_records += record
+        compact_ids_by_look.append(compact_ids)
+
+    built_headers = bytearray()
+    built_data = bytearray()
+    for look_index, compact_ids in enumerate(compact_ids_by_look):
+        section_offsets = [headers_size + len(built_data)]
+        section_counts = [len(compact_ids)]
+        if compact_ids:
+            built_data += struct.pack(f"<{len(compact_ids)}H", *compact_ids)
+        for section_index in range(1, 7):
+            section, count = source_section(look_index, section_index)
+            section_offsets.append(headers_size + len(built_data))
+            if section_index < 6:
+                section_counts.append(count)
+            built_data += section
+        _offsets, _counts, hashes = source_headers[look_index]
+        built_headers += struct.pack(
+            "<7Q6H3I",
+            *section_offsets,
+            *section_counts,
+            *hashes,
+        )
+
+    return (
+        bytes(look_records),
+        bytes(built_headers + built_data),
+        template.payload(BLOCK_HASHES["ModelLookGroup"]),
+    )
+
+
 def _build_look_blocks(
     subset_count,
     string_pool,
@@ -4709,7 +4871,14 @@ def _combine_model_bounds(source_bounds, subset_stats, containment_tolerance=0.0
     return center, tuple(value + radius_padding for value in extents), radius + radius_padding
 
 
-def _build_model_built_block(template, subset_stats, arm=None, has_morph=False, has_smooth=False):
+def _build_model_built_block(
+    template,
+    subset_stats,
+    arm=None,
+    has_morph=False,
+    has_smooth=False,
+    subset_record_count=None,
+):
     block_hash = BLOCK_HASHES["ModelBuilt"]
     original = bytearray(template.payload(block_hash) if block_hash in template.blocks else b"\x00" * MODEL_BUILT_SIZE)
     if len(original) < MODEL_BUILT_SIZE:
@@ -4771,7 +4940,10 @@ def _build_model_built_block(template, subset_stats, arm=None, has_morph=False, 
     struct.pack_into("<f", model_built, MODEL_BUILT_COMMON_MPU_OFFSET, common_mpu)
     struct.pack_into("<f", model_built, MODEL_BUILT_VERTEX_MPU_OFFSET, vertex_mpu)
     struct.pack_into("<I", model_built, MODEL_BUILT_CUSTOM_STREAM_COUNT_OFFSET, sum(stat["custom_stream_count"] for stat in subset_stats))
-    struct.pack_into("<H", model_built, MODEL_BUILT_SUBSET_LOD_MASK_COUNT_OFFSET, len(subset_stats))
+    subset_record_count = len(subset_stats) if subset_record_count is None else int(subset_record_count)
+    if not 0 <= subset_record_count <= 0xFFFF:
+        raise ValueError("The exported model has too many subset records")
+    struct.pack_into("<H", model_built, MODEL_BUILT_SUBSET_LOD_MASK_COUNT_OFFSET, subset_record_count)
     struct.pack_into("<b", model_built, MODEL_BUILT_STRAND_SUBSET_COUNT_OFFSET, 0)
     return bytes(model_built)
 
@@ -5255,8 +5427,7 @@ class ExportEngineModel(Operator, ExportHelper):
         source_has_smooth = BLOCK_HASHES["ModelAnimVertSmoothInfo"] in template.blocks
         discard_unimported_morphs = bool(getattr(arm, "engine_model_discard_unimported_morphs", False))
         compact_lod0 = bool(
-            msmr
-            and getattr(arm, "engine_model_compact_lod0_export", False)
+            getattr(arm, "engine_model_compact_lod0_export", False)
             and not bool(arm.get("engine_model_import_all_lods", False))
         )
         recover_source_morph = (
@@ -5561,6 +5732,7 @@ class ExportEngineModel(Operator, ExportHelper):
                 source_joint_count,
                 export_warnings=export_warnings,
                 source_morph_targets_by_subset=source_morph_targets_by_subset,
+                compact_lod0=compact_lod0,
             )
             morph_info_block, morph_geom_suffix, morph_metadata = encode_model_morph2(
                 morph_targets,
@@ -5571,13 +5743,22 @@ class ExportEngineModel(Operator, ExportHelper):
                 geom_block += morph_geom_suffix
             material_block = _build_material_block(material_entries, string_pool)
             generated_subset_count = len(subset_stats)
-            look_block, look_built_block, look_group_block = _build_look_blocks(
-                generated_subset_count,
-                string_pool,
-                template,
-                arm=arm,
-                subset_index_map=subset_index_map,
-            )
+            if compact_lod0:
+                look_block, look_built_block, look_group_block = (
+                    _build_msm2_compact_lod0_look_blocks(
+                        template,
+                        generated_subset_count,
+                        subset_index_map,
+                    )
+                )
+            else:
+                look_block, look_built_block, look_group_block = _build_look_blocks(
+                    generated_subset_count,
+                    string_pool,
+                    template,
+                    arm=arm,
+                    subset_index_map=subset_index_map,
+                )
             has_smooth = bool(has_morph and source_has_smooth and not source_has_ziva)
             model_built_block = _build_model_built_block(
                 template,
@@ -5585,6 +5766,7 @@ class ExportEngineModel(Operator, ExportHelper):
                 arm=arm,
                 has_morph=has_morph,
                 has_smooth=has_smooth,
+                subset_record_count=len(subset_block) // MODEL_SUBSET_RECORD_SIZE,
             )
 
             replacements = {

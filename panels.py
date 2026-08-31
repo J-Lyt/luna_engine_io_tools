@@ -536,17 +536,20 @@ def _draw_model_export_panel(layout, context, arm):
     box = layout.box()
     box.label(text="Export")
     col = box.column(align=True)
-    if str(arm.get("engine_model_format", "") or "") == "MSMR":
+    model_format = str(arm.get("engine_model_format", "") or "")
+    if model_format == "MSMR":
         col.label(text="Native MSMR wrapper added automatically", icon='CHECKMARK')
-        if not bool(arm.get("engine_model_import_all_lods", False)):
-            col.prop(arm, "engine_model_compact_lod0_export", text="Compact LOD0 Only")
-            if bool(getattr(arm, "engine_model_compact_lod0_export", False)):
-                warning = col.column(align=True)
-                warning.alert = True
-                warning.label(text="Source lower LODs will be omitted", icon='ERROR')
-                warning.label(text="LOD0 will be used at every distance")
     else:
         col.prop(context.scene, "engine_export_add_stg_header", text="Add STG Header")
+    if model_format in {"MSM2", "MSMR"} and not bool(arm.get("engine_model_import_all_lods", False)):
+        col.prop(arm, "engine_model_compact_lod0_export", text="Compact LOD0 Only")
+        if bool(getattr(arm, "engine_model_compact_lod0_export", False)):
+            warning = col.column(align=True)
+            warning.alert = True
+            warning.label(text="Source lower LODs will be omitted", icon='ERROR')
+            warning.label(text="LOD0 will be used at every distance")
+            if model_format == "MSM2":
+                warning.label(text="In-game LOD transitions need further testing", icon='INFO')
     if bool(arm.get("engine_model_source_has_morphs", False)) and not bool(arm.get("engine_model_shape_keys_imported", False)):
         col.prop(arm, "engine_model_discard_unimported_morphs", text="Discard Unimported Morphs")
     col.operator(MODEL_OT_export_with_model_settings.bl_idname, text="Export Model")

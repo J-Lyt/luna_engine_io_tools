@@ -638,8 +638,9 @@ def register_properties():
     bpy.types.Object.engine_model_compact_lod0_export = BoolProperty(
         name="Compact LOD0 Only",
         description=(
-            "Rebuild only the imported MSMR LOD0 subsets and use them at every game LOD distance; "
-            "lower-detail source LOD geometry will not be included"
+            "Rebuild only the imported MSM2 or MSMR LOD0 subsets and use them at every game LOD distance; "
+            "lower-detail source LOD geometry will not be included; MSM2 in-game LOD transitions require "
+            "additional testing"
         ),
         default=False,
     )
